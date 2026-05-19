@@ -7,9 +7,13 @@ Supports comfyui/API calls/modelscope calls
 
 https://apimart.ai/register?aff=1uyAbb
 
+----
+
 【新增了version文件，我每次更新都会更新version的版本号，如果你下载version文件，打开项目GitHub按键就会提示新版本，如果不想查看更新提示，就删除version文件】
+
 【A version file has been added. I update the version number with each update. If you download the version file, you will be notified of the new version when you open the project's GitHub page. If you don't want to see update notifications, delete the version file.】
 
+----
 5/13日更新：
 1. 修复了安装依赖的报错
 2. 增加了更便捷的API设置方式，现在可以全程在网页中设置，并且可以拉取模型一键添加
