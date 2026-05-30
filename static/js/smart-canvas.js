@@ -25,6 +25,7 @@ const selectionBox = document.getElementById('selectionBox');
 const assetToggle = document.getElementById('assetToggle');
 const assetPanel = document.getElementById('assetPanel');
 const assetCloseBtn = document.getElementById('assetCloseBtn');
+const assetLibrarySelect = document.getElementById('assetLibrarySelect');
 const assetCategorySelect = document.getElementById('assetCategorySelect');
 const assetGrid = document.getElementById('assetGrid');
 const assetDropZone = document.getElementById('assetDropZone');
@@ -49,6 +50,7 @@ const promptPresetSave = document.getElementById('promptPresetSave');
 const promptTemplatePanel = document.getElementById('promptTemplatePanel');
 const promptTemplateClose = document.getElementById('promptTemplateClose');
 const promptTemplateSearch = document.getElementById('promptTemplateSearch');
+const promptTemplateLibrarySelect = document.getElementById('promptTemplateLibrarySelect');
 const promptTemplateCats = document.getElementById('promptTemplateCats');
 const promptTemplateBody = document.getElementById('promptTemplateBody');
 const composerTemplateBtn = document.getElementById('composerTemplateBtn');
@@ -78,6 +80,7 @@ let assetLibrary = {categories:[]};
 let assetLibraryOpen = false;
 let assetTab = 'image';
 let activeAssetCategoryId = '';
+let activeAssetLibraryId = '';
 let mentionSource = 'input';
 let mentionAssetCategoryId = '';
 let assetLibraryUpdatedAt = 0;
@@ -87,6 +90,8 @@ const PROMPT_TEMPLATE_GROUPS_KEY = 'smart_canvas_prompt_template_groups_v1';
 const PROMPT_TEMPLATE_OVERRIDES_KEY = 'smart_canvas_prompt_template_overrides_v1';
 let promptPresets = [];
 let builtinPromptTemplates = [];
+let promptLibraries = [];
+let activePromptLibraryId = 'system';
 let promptTemplateGroups = [];
 let promptTemplateOverrides = {hiddenBuiltinIds:[], editedBuiltins:{}};
 let promptTemplateCategory = 'all';
@@ -109,6 +114,7 @@ let smartCascadeActiveLoopId = '';
 let smartCascadeStopRequested = false;
 let smartCascadeSilentSelection = false;
 let smartCascadeRunPath = null;
+const smartCascadeRuns = new Map();
 let smartLoopContext = null;
 let transientSmartCloudLinks = [];
 let runBtnCooldownToken = 0;
@@ -125,6 +131,30 @@ const undoStack = [];
 let undoSuppressed = false;
 let pendingUndoSnapshot = null;
 let runningHubWorkflowCache = {};
+function activeSmartCascadeCount(){ return smartCascadeRuns.size; }
+function smartCascadeRunForLoop(loopId){ return loopId ? smartCascadeRuns.get(loopId) || null : null; }
+function smartCascadeIsLoopRunning(loopId){ return Boolean(smartCascadeRunForLoop(loopId)); }
+function syncSmartCascadeLegacyState(preferredLoopId=''){
+    const activeIds = [...smartCascadeRuns.keys()];
+    smartCascadeRunning = activeIds.length > 0;
+    smartCascadeActiveLoopId = preferredLoopId && smartCascadeRuns.has(preferredLoopId)
+        ? preferredLoopId
+        : (activeIds[0] || '');
+    const activeRun = smartCascadeActiveLoopId ? smartCascadeRuns.get(smartCascadeActiveLoopId) : null;
+    smartCascadeStopRequested = Boolean(activeRun?.stopRequested);
+    smartCascadeRunPath = activeRun?.runPath || null;
+}
+function smartCascadeAnyRunning(){ return smartCascadeRunning || activeSmartCascadeCount() > 0; }
+function smartCascadeEdgeState(edgeKey){
+    for(const run of smartCascadeRuns.values()){
+        const state = run?.runPath?.states?.[edgeKey];
+        if(state) return state;
+    }
+    return smartCascadeRunPath?.states?.[edgeKey] || '';
+}
+function smartCascadePathForCtx(ctx=null){
+    return ctx?.runState?.runPath || ctx?.runPath || smartCascadeRunPath;
+}
 function capturePendingUndo(){ pendingUndoSnapshot = snapshotForUndo(); }
 function commitPendingUndo(){
     if(pendingUndoSnapshot){
@@ -255,6 +285,7 @@ let settings = {
     videoWatermark:false,
     videoCameraFixed:false,
     videoGenerateAudio:false,
+    videoMultimodal:false,
     videoUseFrameRoles:false,
     videoTempShLinks:[],
     msgenModel:'zimage',
@@ -375,6 +406,7 @@ function recentSmartSettingsForMode(modeKey=''){
 }
 function rememberRecentSmartSettings(source=settings, node=null){
     const clean = stripOutpaintDisplaySettings(settingsForStorage(source), node);
+    sanitizeSmartApiSelection(clean);
     if(clean.outpaintResolutionLocked === true && clean.resolution === 'custom'){
         clean.resolution = '1k';
         clean.ratio = clean.ratio || 'square';
@@ -393,6 +425,7 @@ function applyRecentSmartSettingsForCurrentMode(){
     const saved = recentSmartSettingsForMode(key);
     if(!Object.keys(saved).length) return;
     settings = {...settings, ...saved};
+    sanitizeSmartApiSelection(settings);
 }
 function isSmartImageNode(node){
     return Boolean(node && (node.type === 'smart-image' || !node.type));
@@ -949,7 +982,7 @@ function toggleZoomPreview(){
     else enterZoomPreview();
 }
 function imageProviders(){
-    return (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'modelscope' && p.id !== 'runninghub' && p.id !== 'volcengine' && (p.image_models || []).length);
+    return (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'modelscope' && p.id !== 'runninghub' && (p.image_models || []).length);
 }
 function volcengineProvider(){
     return (apiProviders || []).find(p => p.id === 'volcengine' && p.enabled !== false) || {
@@ -1067,6 +1100,30 @@ function providerImageModels(providerId){
     if(providerId === 'volcengine') return volcengineProvider().image_models || [];
     return (apiProviders || []).find(p => p.id === providerId)?.image_models || [];
 }
+function sanitizeSmartApiSelection(target=settings){
+    if(!target || typeof target !== 'object') return target;
+    if(target.engine === 'volcengine'){
+        if(target.apiKind === 'video'){
+            target.videoProvider = 'volcengine';
+            const models = volcengineVideoModels();
+            if(!models.includes(target.videoModel)) target.videoModel = models[0] || '';
+        } else {
+            target.provider_id = 'volcengine';
+            const models = providerImageModels('volcengine');
+            if(!models.includes(target.model)) target.model = models[0] || '';
+        }
+        return target;
+    }
+    if(target.provider_id){
+        const models = providerImageModels(target.provider_id);
+        if(models.length && !models.includes(target.model)) target.model = models[0] || '';
+    }
+    if(target.videoProvider){
+        const models = providerVideoModels(target.videoProvider);
+        if(models.length && !models.includes(target.videoModel)) target.videoModel = models[0] || '';
+    }
+    return target;
+}
 function modelscopeProvider(){
     return (apiProviders || []).find(p => p.id === 'modelscope' && p.enabled !== false) || null;
 }
@@ -1075,7 +1132,7 @@ function modelscopeImageModels(){
 }
 const DEFAULT_VIDEO_MODELS = ['veo3-fast','veo3','sora','runway','kling','pika','minimax-video','wan-v2','seedance-1.0-pro','jimeng-vide-3.0','jimeng-video-3.0-pro'];
 function videoApiProviders(){
-    const fromConfig = (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'runninghub' && p.id !== 'volcengine' && (p.video_models || []).length);
+    const fromConfig = (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'runninghub' && (p.video_models || []).length);
     if(fromConfig.length) return fromConfig;
     return [{id:'comfly', name:'Comfly', video_models:DEFAULT_VIDEO_MODELS, enabled:true}];
 }
@@ -1286,6 +1343,7 @@ function renderApiVideoParams(){
         ${renderVideoToggleControl('videoGenerateAudio', tr('smart.videoGenerateAudio'))}
         ${renderVideoToggleControl('videoCameraFixed', tr('smart.videoCameraFixed'))}
         ${renderVideoToggleControl('videoWatermark', tr('smart.videoWatermark'))}
+        ${renderVideoToggleControl('videoMultimodal', tr('smart.videoMultimodal'))}
         ${renderVideoToggleControl('videoUseFrameRoles', tr('smart.videoUseFrameRoles'))}
     `;
 }
@@ -1325,6 +1383,7 @@ function renderVolcengineVideoParams(){
         ${renderVideoToggleControl('videoGenerateAudio', tr('smart.videoGenerateAudio'))}
         ${renderVideoToggleControl('videoCameraFixed', tr('smart.videoCameraFixed'))}
         ${renderVideoToggleControl('videoWatermark', tr('smart.videoWatermark'))}
+        ${renderVideoToggleControl('videoMultimodal', tr('smart.videoMultimodal'))}
         ${renderVideoToggleControl('videoUseFrameRoles', tr('smart.videoUseFrameRoles'))}
     `;
 }
@@ -2269,6 +2328,8 @@ function setDynamicSetting(key, value){
     settings[key] = numericKeys.has(key) && value !== '' ? Number(value) : value;
     if(key === 'provider_id') settings.model = '';
     if(key === 'videoProvider') settings.videoModel = '';
+    if(key === 'videoMultimodal' && settings.videoMultimodal) settings.videoUseFrameRoles = false;
+    if(key === 'videoUseFrameRoles' && settings.videoUseFrameRoles) settings.videoMultimodal = false;
     if(key === 'comfyMode') applyRecentSmartSettingsForCurrentMode();
     if(key === 'resolution'){
         if(settings.resolution === 'custom') settings.ratio = '';
@@ -2339,6 +2400,8 @@ function bindDynamicParams(){
             event.preventDefault();
             event.stopPropagation();
             settings[btn.dataset.toggleParam] = !settings[btn.dataset.toggleParam];
+            if(btn.dataset.toggleParam === 'videoMultimodal' && settings.videoMultimodal) settings.videoUseFrameRoles = false;
+            if(btn.dataset.toggleParam === 'videoUseFrameRoles' && settings.videoUseFrameRoles) settings.videoMultimodal = false;
             persistActiveSmartSettings();
             renderDynamicParams();
             scheduleSave();
@@ -2479,6 +2542,7 @@ async function loadConfig(){
             try { await ensureRunningHubWorkflow(workflowId); } catch(_) {}
         }));
         lastConfigRefreshAt = Date.now();
+        sanitizeSmartApiSelection(settings);
         updateProviderModels();
     } catch(e) {
         toast(tr('smart.toastApiSettingsFail'));
@@ -2488,7 +2552,10 @@ async function refreshSmartConfigFromSettings(){
     await loadConfig();
     renderDynamicParams();
     const node = selectedNode();
-    if(node?.type === 'smart-prompt') render();
+    if(node?.type === 'smart-prompt') {
+        applySettingsToNode(node);
+        render();
+    }
 }
 function loadPromptPresets(){
     try {
@@ -2541,13 +2608,41 @@ function savePromptTemplateOverrides(){
 }
 async function loadPromptTemplates(){
     try {
-        const data = await fetch('/api/smart-canvas/prompt-templates').then(r => r.ok ? r.json() : {templates:[]});
-        builtinPromptTemplates = Array.isArray(data.templates) ? data.templates.filter(t => t?.id && t?.positive) : [];
+        const data = await fetch('/api/prompt-libraries').then(r => r.ok ? r.json() : {library:{libraries:[]}});
+        promptLibraries = Array.isArray(data.library?.libraries) ? data.library.libraries : [];
+        if(!promptLibraries.length) {
+            const fallback = await fetch('/api/smart-canvas/prompt-templates').then(r => r.ok ? r.json() : {templates:[]});
+            builtinPromptTemplates = Array.isArray(fallback.templates) ? fallback.templates.filter(t => t?.id && t?.positive) : [];
+            promptLibraries = [{id:'system', name:'系统提示词库', readonly:true, items:builtinPromptTemplates}];
+        } else {
+            const system = promptLibraries.find(lib => lib.id === 'system') || promptLibraries[0];
+            builtinPromptTemplates = Array.isArray(system?.items) ? system.items.filter(t => t?.id && t?.positive) : [];
+        }
+        if(!promptLibraries.some(lib => lib.id === activePromptLibraryId)) activePromptLibraryId = promptLibraries[0]?.id || 'system';
+        renderPromptLibrarySelect();
     } catch(e) {
         builtinPromptTemplates = [];
+        promptLibraries = [];
     }
 }
+function activePromptLibrary(){
+    return promptLibraries.find(lib => lib.id === activePromptLibraryId) || promptLibraries[0] || {id:'system', name:'系统提示词库', readonly:true, items:builtinPromptTemplates};
+}
+function renderPromptLibrarySelect(){
+    if(!promptTemplateLibrarySelect) return;
+    promptTemplateLibrarySelect.innerHTML = promptLibraries.map(lib => `<option value="${escapeAttr(lib.id)}" ${lib.id === activePromptLibraryId ? 'selected' : ''}>${escapeHtml(lib.name || '提示词库')}</option>`).join('');
+}
 function promptTemplateItems(){
+    const activeLibrary = activePromptLibrary();
+    if(activeLibrary.id !== 'system'){
+        return (activeLibrary.items || []).filter(t => t?.id && t?.positive).map(t => ({
+            ...t,
+            sourceId:t.id,
+            builtin:false,
+            remote:true,
+            libraryId:activeLibrary.id
+        }));
+    }
     const hidden = new Set(promptTemplateOverrides.hiddenBuiltinIds || []);
     const builtins = builtinPromptTemplates
         .filter(t => !hidden.has(t.id))
@@ -2724,6 +2819,7 @@ function restorePromptTemplateScroll(snapshot){
 }
 function renderPromptTemplatePanel(options={}){
     if(!promptTemplatePanel || !promptTemplateBody || !promptTemplateCats) return;
+    renderPromptLibrarySelect();
     const scrollSnapshot = options.preserveScroll === false ? null : promptTemplateScrollSnapshot();
     const query = String(promptTemplateSearch?.value || '').trim().toLowerCase();
     const allTemplates = promptTemplateItems();
@@ -2777,17 +2873,18 @@ function renderPromptTemplatePanel(options={}){
     });
     if(items.length && !items.some(item => item.id === promptTemplateSelectedId)) promptTemplateSelectedId = items[0].id;
     const selected = items.find(item => item.id === promptTemplateSelectedId) || items[0] || null;
-    const selectedPreset = selected?.builtin
-        ? {id:selected.id, name:selected.name || '', text:selected.positive || '', category:selected.category || 'storyboard', builtin:true}
+    const selectedPreset = selected?.builtin || selected?.remote
+        ? {id:selected.id, name:selected.name || '', text:selected.positive || '', category:selected.category || 'storyboard', builtin:Boolean(selected.builtin)}
         : (selected ? currentPromptPreset(selected.sourceId) : null);
     const target = promptTemplatePanel.dataset.target || 'node';
     const node = nodes.find(n => n.id === promptTemplatePanel.dataset.nodeId);
-    const nodeHasText = target === 'composer' ? Boolean(promptPlainText()) : Boolean(String(node?.text || '').trim());
+    const activeLibrary = activePromptLibrary();
+    const canEditCurrentLibrary = activeLibrary.id !== 'system' && !activeLibrary.readonly;
     const editMode = Boolean(promptTemplateEditing && selectedPreset);
     promptTemplateBody.innerHTML = `
         <div class="prompt-template-list">
             <div class="prompt-template-list-tools">
-                <button type="button" ${nodeHasText ? '' : 'disabled'} data-template-save-current><i data-lucide="bookmark-plus"></i><span>${escapeHtml(tr('smart.tplSaveCurrent'))}</span></button>
+                <button type="button" data-template-save-current><i data-lucide="bookmark-plus"></i><span>${escapeHtml(tr('smart.tplSaveCurrent'))}</span></button>
                 <button type="button" data-template-new><i data-lucide="file-plus-2"></i><span>${escapeHtml(tr('smart.tplNewTemplate'))}</span></button>
             </div>
             ${items.length ? items.map(item => `<button type="button" class="prompt-template-card ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeHtml(item.id)}">
@@ -2808,8 +2905,8 @@ function renderPromptTemplatePanel(options={}){
                     </div>
                     ${editMode ? '' : `
                         <div class="prompt-template-icon-actions">
-                            <button type="button" data-template-edit title="${escapeAttr(tr('smart.tplEditTemplate'))}"><i data-lucide="pencil"></i><span>${escapeHtml(tr('common.edit'))}</span></button>
-                            <button type="button" class="danger" data-template-delete title="${escapeAttr(tr('smart.tplDeleteTemplate'))}"><i data-lucide="trash-2"></i><span>${escapeHtml(tr('common.delete'))}</span></button>
+                            <button type="button" ${selected?.builtin || !canEditCurrentLibrary ? 'disabled' : ''} data-template-edit title="${escapeAttr(tr('smart.tplEditTemplate'))}"><i data-lucide="pencil"></i><span>${escapeHtml(tr('common.edit'))}</span></button>
+                            <button type="button" ${selected?.builtin || !canEditCurrentLibrary ? 'disabled' : ''} class="danger" data-template-delete title="${escapeAttr(tr('smart.tplDeleteTemplate'))}"><i data-lucide="trash-2"></i><span>${escapeHtml(tr('common.delete'))}</span></button>
                         </div>
                     `}
                 </div>
@@ -2910,34 +3007,79 @@ function applyPromptTemplateToNode(mode='positive'){
     render();
     scheduleSave();
 }
-function saveCurrentPromptAsTemplate(){
-    const preset = promptTemplatePanel?.dataset.target === 'composer'
-        ? createPromptPresetFromComposer()
-        : createPromptPresetFromNode(nodes.find(n => n.id === promptTemplatePanel?.dataset.nodeId), {openPanel:false});
-    if(!preset) return;
-    promptTemplateCategory = 'mine';
-    promptTemplateSelectedId = `mine:${preset.id}`;
-    promptTemplateEditing = true;
-    renderPromptTemplatePanel({preserveScroll:false});
+async function saveCurrentPromptAsTemplate(){
+    const library = activePromptLibrary();
+    if(library.id === 'system' || library.readonly){ toast('请选择可编辑的提示词库'); return; }
+    const text = promptTemplatePanel?.dataset.target === 'composer'
+        ? promptPlainText()
+        : String(nodes.find(n => n.id === promptTemplatePanel?.dataset.nodeId)?.text || '').trim();
+    if(!text){ toast(tr('smart.promptPresetEmpty')); return; }
+    try {
+        const data = await fetch('/api/prompt-libraries/items', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({library_id:library.id, name:defaultPromptPresetName(text), category:promptTemplateCategory === 'all' ? 'mine' : promptTemplateCategory, positive:text, scene:'我的提示词预设'})
+        }).then(async r => {
+            if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存失败');
+            return r.json();
+        });
+        promptLibraries = data.library?.libraries || promptLibraries;
+        activePromptLibraryId = library.id;
+        promptTemplateCategory = data.item?.category || 'mine';
+        promptTemplateSelectedId = data.item?.id || '';
+        promptTemplateEditing = true;
+        renderPromptTemplatePanel({preserveScroll:false});
+    } catch(err) {
+        toast(err.message || '保存失败');
+    }
 }
-function createBlankPromptTemplate(){
+async function createBlankPromptTemplate(){
+    const library = activePromptLibrary();
+    if(library.id === 'system' || library.readonly){ toast('请选择可编辑的提示词库'); return; }
     const category = promptTemplateCategory && promptTemplateCategory !== 'all' ? promptTemplateCategory : 'mine';
-    const preset = {id:uid('preset'), name:tr('smart.tplNewTemplateName'), text:'', category, createdAt:Date.now(), updatedAt:Date.now()};
-    promptPresets.unshift(preset);
-    savePromptPresets();
-    promptTemplateCategory = category;
-    promptTemplateSelectedId = `mine:${preset.id}`;
-    promptTemplateEditing = true;
-    renderPromptTemplatePanel({preserveScroll:false});
+    try {
+        const data = await fetch('/api/prompt-libraries/items', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({library_id:library.id, name:tr('smart.tplNewTemplateName'), category, positive:'新提示词', scene:'我的提示词预设'})
+        }).then(async r => {
+            if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '创建失败');
+            return r.json();
+        });
+        promptLibraries = data.library?.libraries || promptLibraries;
+        activePromptLibraryId = library.id;
+        promptTemplateCategory = category;
+        promptTemplateSelectedId = data.item?.id || '';
+        promptTemplateEditing = true;
+        renderPromptTemplatePanel({preserveScroll:false});
+    } catch(err) {
+        toast(err.message || '创建失败');
+    }
 }
-function savePromptTemplateEdit(){
+async function savePromptTemplateEdit(){
     const item = promptTemplateSelectedItem();
     if(!item) return;
     const name = promptTemplatePanel.querySelector('[data-template-edit-name]')?.value?.trim() || '';
     const text = promptTemplatePanel.querySelector('[data-template-edit-text]')?.value?.trim() || '';
     const category = promptTemplatePanel.querySelector('[data-template-edit-category]')?.value || 'mine';
     if(!name || !text){ toast(tr('smart.tplRequired')); return; }
-    if(item.builtin){
+    if(item.remote){
+        try {
+            const data = await fetch(`/api/prompt-libraries/items/${encodeURIComponent(item.id)}`, {
+                method:'PATCH',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({library_id:item.libraryId || activePromptLibrary().id, name, category, positive:text, scene:item.scene || '', negative:item.negative || ''})
+            }).then(async r => {
+                if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存失败');
+                return r.json();
+            });
+            promptLibraries = data.library?.libraries || promptLibraries;
+            promptTemplateSelectedId = data.item?.id || item.id;
+        } catch(err) {
+            toast(err.message || '保存失败');
+            return;
+        }
+    } else if(item.builtin){
         promptTemplateOverrides.editedBuiltins = promptTemplateOverrides.editedBuiltins || {};
         promptTemplateOverrides.editedBuiltins[item.id] = {
             ...(promptTemplateOverrides.editedBuiltins[item.id] || {}),
@@ -2959,10 +3101,21 @@ function savePromptTemplateEdit(){
     render();
     scheduleSave();
 }
-function deletePromptTemplate(){
+async function deletePromptTemplate(){
     const item = promptTemplateSelectedItem();
     if(!item) return;
-    if(item.builtin){
+    if(item.remote){
+        try {
+            const data = await fetch(`/api/prompt-libraries/items/${encodeURIComponent(item.id)}`, {method:'DELETE'}).then(async r => {
+                if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '删除失败');
+                return r.json();
+            });
+            promptLibraries = data.library?.libraries || promptLibraries;
+        } catch(err) {
+            toast(err.message || '删除失败');
+            return;
+        }
+    } else if(item.builtin){
         promptTemplateOverrides.hiddenBuiltinIds = [...new Set([...(promptTemplateOverrides.hiddenBuiltinIds || []), item.id])];
         savePromptTemplateOverrides();
     } else {
@@ -3015,7 +3168,15 @@ function editPromptPresetForNode(node){
     openPromptTemplatePanel(node?.id || '', node?.promptPresetId ? `mine:${node.promptPresetId}` : '');
 }
 function assetCategories(type='image'){
-    return (assetLibrary.categories || []).filter(cat => (cat.type || 'image') === type);
+    const library = activeAssetLibrary();
+    return (library?.categories || assetLibrary.categories || []).filter(cat => (cat.type || 'image') === type);
+}
+function assetLibraries(){
+    return Array.isArray(assetLibrary.libraries) && assetLibrary.libraries.length ? assetLibrary.libraries : [{id:'default', name:'默认资产库', categories:assetLibrary.categories || []}];
+}
+function activeAssetLibrary(){
+    const libs = assetLibraries();
+    return libs.find(lib => lib.id === activeAssetLibraryId) || libs[0] || null;
 }
 function activeAssetCategory(){
     const cats = assetCategories('image');
@@ -3080,6 +3241,9 @@ function connectAssetLibrarySyncSocket(){
 function setAssetLibraryFromResponse(data, options={}){
     assetLibrary = data.library || assetLibrary;
     assetLibraryUpdatedAt = Number(assetLibrary.updated_at || assetLibraryUpdatedAt || 0);
+    const libs = assetLibraries();
+    if(!activeAssetLibraryId) activeAssetLibraryId = assetLibrary.active_library_id || libs[0]?.id || '';
+    if(activeAssetLibraryId && !libs.some(lib => lib.id === activeAssetLibraryId)) activeAssetLibraryId = libs[0]?.id || '';
     const cats = assetCategories('image');
     if(activeAssetCategoryId && !cats.some(cat => cat.id === activeAssetCategoryId)) activeAssetCategoryId = '';
     if(!activeAssetCategoryId) activeAssetCategoryId = activeAssetCategory()?.id || '';
@@ -3091,6 +3255,7 @@ function setAssetLibraryFromResponse(data, options={}){
     }
 }
 function toggleAssetLibrary(open=!assetLibraryOpen){
+    if(!assetPanel || !assetToggle) return;
     assetLibraryOpen = !!open;
     assetPanel.classList.toggle('open', assetLibraryOpen);
     assetToggle?.classList.toggle('active', assetLibraryOpen);
@@ -3128,7 +3293,13 @@ function assetThumbHtml(item){
     return `<img class="asset-thumb" src="${thumb}" alt="">`;
 }
 function renderAssetLibrary(){
+    if(!assetPanel || !assetGrid || !assetCategorySelect) return;
     document.querySelectorAll('[data-asset-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.assetTab === assetTab));
+    const libs = assetLibraries();
+    if(!activeAssetLibraryId || !libs.some(lib => lib.id === activeAssetLibraryId)) activeAssetLibraryId = libs[0]?.id || '';
+    if(assetLibrarySelect){
+        assetLibrarySelect.innerHTML = libs.map(lib => `<option value="${escapeHtml(lib.id)}" ${lib.id === activeAssetLibraryId ? 'selected' : ''}>${escapeHtml(lib.name || '资产库')}</option>`).join('');
+    }
     const imageMode = assetTab === 'image';
     assetImageControls.style.display = imageMode ? 'block' : 'none';
     assetDropZone.style.display = imageMode ? 'flex' : 'none';
@@ -3154,17 +3325,20 @@ function renderAssetLibrary(){
     refreshIcons();
 }
 function openAssetNameDialog({title='', value='', placeholder='', cancelValue='', multiline=false }={}){
+    if(!assetDialogBackdrop || !assetDialogInput || !assetDialogOk || !assetDialogCancel) return Promise.resolve(cancelValue);
     return new Promise(resolve => {
         assetDialogTitle.textContent = title || tr('smart.assetRename');
         assetDialogInput.value = value || '';
         assetDialogInput.placeholder = placeholder || '';
         assetDialogInput.classList.toggle('is-multiline', Boolean(multiline));
         assetDialogInput.rows = multiline ? 5 : 1;
+        assetDialogBackdrop.hidden = false;
         assetDialogBackdrop.classList.add('open');
         assetDialogInput.focus();
         assetDialogInput.select();
         const cleanup = result => {
             assetDialogBackdrop.classList.remove('open');
+            assetDialogBackdrop.hidden = true;
             assetDialogOk.onclick = null;
             assetDialogCancel.onclick = null;
             assetDialogInput.onkeydown = null;
@@ -3186,7 +3360,7 @@ function openAssetNameDialog({title='', value='', placeholder='', cancelValue=''
     });
 }
 function positionAssetHoverPreview(event){
-    if(!assetHoverPreview || assetHoverPreview.style.display === 'none') return;
+    if(!assetHoverPreview || assetHoverPreview.hidden || assetHoverPreview.style.display === 'none') return;
     const pad = 14;
     const w = assetHoverPreview.offsetWidth || 260;
     const h = assetHoverPreview.offsetHeight || 300;
@@ -3225,12 +3399,14 @@ function showAssetHoverPreview(event, item){
         media.alt = 'asset preview';
     }
     name.textContent = item.name || 'asset';
+    assetHoverPreview.hidden = false;
     assetHoverPreview.style.display = 'block';
     positionAssetHoverPreview(event);
 }
 function hideAssetHoverPreview(){
     if(!assetHoverPreview) return;
     assetHoverPreview.style.display = 'none';
+    assetHoverPreview.hidden = true;
     const media = assetHoverPreview.querySelector('img,video');
     media?.pause?.();
     media?.removeAttribute('src');
@@ -3325,7 +3501,7 @@ function bindAssetItemEvents(){
 async function addUrlToAssetLibrary(url, name=''){
     const cat = activeAssetCategory();
     if(!cat){ toast(tr('smart.assetNoFolder')); return; }
-    const data = await fetch('/api/asset-library/items', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({category_id:cat.id, url, name})}).then(async r => {
+    const data = await fetch('/api/asset-library/items', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({library_id:activeAssetLibraryId, category_id:cat.id, url, name})}).then(async r => {
         if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || tr('smart.assetAddFail'));
         return r.json();
     });
@@ -3579,7 +3755,7 @@ function renderConnections(){
         const isHistory = kind === 'history';
         const isInsertPreview = loopInsertPreview?.index === conn.index;
         const edgeKey = `${conn.from}->${conn.to}`;
-        const cascadeState = smartCascadeRunPath?.states?.[edgeKey] || '';
+        const cascadeState = smartCascadeEdgeState(edgeKey);
         const isCascade = !isHistory && (cascadeKeys.has(edgeKey) || Boolean(cascadeState) || isInsertPreview);
         const isPendingLine = Boolean(toNode.pending && !isCascade);
         const fx = isHistory ? fr.x + fr.width / 2 : fr.x + fr.width;
@@ -4306,9 +4482,9 @@ function smartLoopBodyHtml(node){
         : tr('smart.loopPromptHintVariable');
     const currentUpstreamPrompt = smartLoopSelectedInputPrompt(node, {index:node.loopStart});
     const defaultPrompt = tr('smart.loopDefaultPrompt') || '现在生成第《计数》张卖点图片';
-    const loopRunning = smartCascadeRunning && smartCascadeActiveLoopId === node.id;
-    const loopStopping = loopRunning && smartCascadeStopRequested;
-    const otherLoopRunning = smartCascadeRunning && !loopRunning;
+    const loopRunState = smartCascadeRunForLoop(node.id);
+    const loopRunning = Boolean(loopRunState);
+    const loopStopping = Boolean(loopRunState?.stopRequested);
     return `<div class="loop-smart-card ${node.imageInput ? 'has-image' : ''} ${node.showPrompt ? 'has-prompt' : ''}">
         <div class="loop-smart-row loop-smart-top">
             <div class="loop-smart-seg">
@@ -4348,7 +4524,7 @@ function smartLoopBodyHtml(node){
         <div class="loop-smart-footer">
             ${loopNumberControlHtml({label:tr('canvas.loopImageStart'), value:node.loopStart, key:'loopStart', max:9999, quick:[1,2,3,4,5,6,8,10]})}
             ${loopNumberControlHtml({label:tr('canvas.loopCount'), value:node.count, key:'count', max:100, quick:[1,2,3,4,5,6,8,10]})}
-            <button class="loop-smart-control loop-smart-run ${loopRunning ? 'is-stop' : ''}" type="button" data-loop-run="${escapeHtml(node.id)}" ${otherLoopRunning || loopStopping ? 'disabled' : ''}><i data-lucide="${loopRunning ? 'square' : 'workflow'}"></i><span>${escapeHtml(loopRunning ? smartCascadeStopText(loopStopping) : tr('smart.loopRunAll'))}</span></button>
+            <button class="loop-smart-control loop-smart-run ${loopRunning ? 'is-stop' : ''}" type="button" data-loop-run="${escapeHtml(node.id)}" ${loopStopping ? 'disabled' : ''}><i data-lucide="${loopRunning ? 'square' : 'workflow'}"></i><span>${escapeHtml(loopRunning ? smartCascadeStopText(loopStopping) : tr('smart.loopRunAll'))}</span></button>
         </div>
     </div>`;
 }
@@ -4787,11 +4963,12 @@ function bindLoopNodeControls(el, node){
         btn.onclick = e => {
             e.preventDefault();
             e.stopPropagation();
-            if(smartCascadeRunning && smartCascadeActiveLoopId === (btn.dataset.loopRun || node.id)){
-                requestSmartCascadeStop();
+            const loopId = btn.dataset.loopRun || node.id;
+            if(smartCascadeIsLoopRunning(loopId)){
+                requestSmartCascadeStop(loopId);
                 return;
             }
-            runSmartCascadeFromLoop(btn.dataset.loopRun || node.id);
+            runSmartCascadeFromLoop(loopId);
         };
     });
 }
@@ -4960,7 +5137,7 @@ function bindNodeEvents(){
             selectedId = id;
             selectedIds = [];
             selectedImage = {nodeId:'', index:-1};
-            if(smartCascadeRunning) smartCascadeSilentSelection = false;
+        if(smartCascadeAnyRunning()) smartCascadeSilentSelection = false;
             render();
         };
         el.ondblclick = e => e.stopPropagation();
@@ -5040,7 +5217,7 @@ function bindNodeEvents(){
                 selectedImage = isGroupOwner
                     ? {nodeId:'', index:-1}
                     : {nodeId:id, index:imageIndex};
-                    if(smartCascadeRunning) smartCascadeSilentSelection = false;
+                    if(smartCascadeAnyRunning()) smartCascadeSilentSelection = false;
                     syncSelectionUi();
                     updateComposer();
                 }, 220);
@@ -8544,7 +8721,8 @@ function createLoopOutputSlot(rootNode, roundIndex, roundOffset=0, options={}){
     output.y = y;
     nodes.push(output);
     addConnection(rootNode.id, output.id, 'flow');
-    if(smartCascadeRunPath?.states) smartCascadeRunPath.states[`${rootNode.id}->${output.id}`] = 'wait';
+        const runPath = smartCascadePathForCtx(options.ctx || options.runState);
+        if(runPath?.states) runPath.states[`${rootNode.id}->${output.id}`] = 'wait';
     return output;
 }
 function extractCurrentImagesToSource(node, meta=null){
@@ -8890,8 +9068,9 @@ function cascadeConnectionKeys(){
     const addKey = (from, to) => {
         if(from && to) keys.add(`${from}->${to}`);
     };
-    const loops = smartCascadeRunning && smartCascadeActiveLoopId
-        ? nodes.filter(n => n?.type === 'smart-loop' && n.id === smartCascadeActiveLoopId)
+    const activeLoopIds = new Set(smartCascadeRuns.keys());
+    const loops = activeLoopIds.size
+        ? nodes.filter(n => n?.type === 'smart-loop' && activeLoopIds.has(n.id))
         : nodes.filter(n => n?.type === 'smart-loop');
     loops.forEach(loop => {
         const tail = cascadeTailForLoop(loop.id);
@@ -8916,7 +9095,7 @@ function coolRunButton(ms=2000){
     const token = ++runBtnCooldownToken;
     runBtn.disabled = true;
     setTimeout(() => {
-        if(token === runBtnCooldownToken && !smartCascadeRunning) runBtn.disabled = false;
+        if(token === runBtnCooldownToken && !smartCascadeAnyRunning()) runBtn.disabled = false;
     }, ms);
     return token;
 }
@@ -9090,11 +9269,13 @@ function syncCascadeRunButton(node=selectedNode()){
     if(!cascadeRunBtn) return;
     const visible = canRunSmartCascade(node);
     cascadeRunBtn.style.display = visible ? 'inline-flex' : 'none';
-    const runningForNode = Boolean(smartCascadeRunning && smartCascadeActiveLoopId && resolveSmartCascadeLoop(node?.id)?.node?.id === smartCascadeActiveLoopId);
-    cascadeRunBtn.disabled = !visible || (!runningForNode && Boolean(node?.running)) || (smartCascadeRunning && (!runningForNode || smartCascadeStopRequested));
+    const nodeLoopId = resolveSmartCascadeLoop(node?.id)?.node?.id || '';
+    const loopRunState = smartCascadeRunForLoop(nodeLoopId);
+    const runningForNode = Boolean(loopRunState);
+    cascadeRunBtn.disabled = !visible || (!runningForNode && Boolean(node?.running)) || Boolean(loopRunState?.stopRequested);
     cascadeRunBtn.classList.toggle('is-stop', runningForNode);
     cascadeRunBtn.innerHTML = runningForNode
-        ? `<i data-lucide="square"></i><span>${escapeHtml(smartCascadeStopText(smartCascadeStopRequested))}</span>`
+        ? `<i data-lucide="square"></i><span>${escapeHtml(smartCascadeStopText(Boolean(loopRunState?.stopRequested)))}</span>`
         : `<i data-lucide="workflow"></i><span>${escapeHtml(tr('smart.loopRunAll'))}</span>`;
     refreshIcons();
 }
@@ -9414,8 +9595,9 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
         delete outputSlot.runFinishedAt;
         delete outputSlot.runElapsedMs;
         outputSlot.runTimerHidden = false;
-        if(smartCascadeRunPath?.states) {
-            smartCascadeRunPath.states[edgeKey] = 'active';
+        const runPath = smartCascadePathForCtx(ctx);
+        if(runPath?.states) {
+            runPath.states[edgeKey] = 'active';
             refreshConnectionLayer();
         }
         render();
@@ -9460,8 +9642,8 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
             }).filter(item => item.url);
             replaceOutputsToNodeWithHistory(outputSlot, additions, result.kind, meta, {skipShift:Boolean(ctx?.nodeId)});
         }
-        if(smartCascadeRunPath?.states) {
-            smartCascadeRunPath.states[edgeKey] = 'done';
+        if(runPath?.states) {
+            runPath.states[edgeKey] = 'done';
             refreshConnectionLayer();
         }
         addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
@@ -9475,7 +9657,7 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
         settings = previousSettings;
     }
 }
-function appendCascadeRefsToReceiver(node, refs){
+function appendCascadeRefsToReceiver(node, refs, ctx=smartLoopContext){
     if(!node || !refs?.length) return [];
     const additions = refs
         .filter(ref => ref?.url)
@@ -9485,7 +9667,7 @@ function appendCascadeRefsToReceiver(node, refs){
             kind:ref.kind || (isVideoMediaItem(ref) ? 'video' : 'image')
         }));
     if(!additions.length) return [];
-    replaceOutputsToNodeWithHistory(node, additions, mediaKindForUrls(additions, additions.some(isVideoMediaItem) ? 'video' : 'image'), null, {skipShift:Boolean(smartLoopContext?.nodeId)});
+    replaceOutputsToNodeWithHistory(node, additions, mediaKindForUrls(additions, additions.some(isVideoMediaItem) ? 'video' : 'image'), null, {skipShift:Boolean(ctx?.nodeId)});
     render();
     return additions;
 }
@@ -9507,12 +9689,19 @@ function smartCascadeAbortError(){
     err.smartCascadeStopped = true;
     return err;
 }
-function throwIfSmartCascadeStopRequested(){
-    if(smartCascadeStopRequested) throw smartCascadeAbortError();
+function throwIfSmartCascadeStopRequested(runState=null){
+    if(runState?.stopRequested || (!runState && smartCascadeStopRequested)) throw smartCascadeAbortError();
 }
-function requestSmartCascadeStop(){
-    if(!smartCascadeRunning || smartCascadeStopRequested) return;
-    smartCascadeStopRequested = true;
+function requestSmartCascadeStop(loopId=''){
+    const runState = loopId ? smartCascadeRunForLoop(loopId) : (smartCascadeRuns.get(smartCascadeActiveLoopId) || [...smartCascadeRuns.values()][0] || null);
+    if(runState){
+        if(runState.stopRequested) return;
+        runState.stopRequested = true;
+        syncSmartCascadeLegacyState(runState.runKey || runState.loopId || loopId);
+    } else {
+        if(!smartCascadeRunning || smartCascadeStopRequested) return;
+        smartCascadeStopRequested = true;
+    }
     toast('已请求停止，当前任务完成后停止');
     render();
 }
@@ -9520,12 +9709,12 @@ function smartCascadeParallelLimit(chain=[]){
     const hasComfy = (chain || []).some(node => smartSettingsForNode(node)?.engine === 'comfy');
     return hasComfy ? Math.max(1, Math.min(6, Number(comfyInstanceCount) || 1)) : 6;
 }
-async function runSmartCascadeRoundsWithLimit(roundIndexes, limit, runner){
+async function runSmartCascadeRoundsWithLimit(roundIndexes, limit, runner, runState=null){
     let next = 0;
     const workerCount = Math.max(1, Math.min(Number(limit) || 1, roundIndexes.length));
     const workers = Array.from({length:workerCount}, async () => {
         while(next < roundIndexes.length){
-            if(smartCascadeStopRequested) break;
+            if(runState?.stopRequested || (!runState && smartCascadeStopRequested)) break;
             const roundOffset = next++;
             const current = roundIndexes[roundOffset];
             try {
@@ -9541,20 +9730,23 @@ async function runSmartCascadeRoundsWithLimit(roundIndexes, limit, runner){
 async function runSmartCascade(targetNode=null){
     const tail = targetNode || selectedNode();
     if(!canRunSmartCascade(tail)){ toast('请选择链路结尾图片节点'); return; }
-    if(smartCascadeRunning){ requestSmartCascadeStop(); return; }
     savePromptDraftForCurrent();
     const graph = smartCascadeGraphForTail(tail);
     const chain = graph.path;
     const loop = resolveSmartCascadeLoop(tail.id);
+    const loopId = loop?.node?.id || '';
+    if(loopId && smartCascadeIsLoopRunning(loopId)){ requestSmartCascadeStop(loopId); return; }
+    if(!loopId && smartCascadeAnyRunning()){ requestSmartCascadeStop(); return; }
     const directLoopTargetRun = Boolean(loop && isDirectLoopTargetRun(loop, tail, graph));
     const singleNodeLoopRun = Boolean(loop && (chain.length === 1 || directLoopTargetRun));
     if(!graph.edges.length && !singleNodeLoopRun){ toast(tr('smart.loopNoChain')); return; }
     const originalSelected = selectedId;
     const originalSettings = cloneSmartSettings(settings);
     const originalPromptHtml = promptInput.innerHTML;
-    smartCascadeRunning = true;
-    smartCascadeActiveLoopId = loop?.node?.id || '';
-    smartCascadeStopRequested = false;
+    const runKey = loopId || `cascade-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const runState = {runKey, loopId, stopRequested:false, runPath:null};
+    smartCascadeRuns.set(runKey, runState);
+    syncSmartCascadeLegacyState(runKey);
     smartCascadeSilentSelection = true;
     runBtn.disabled = true;
     cascadeRunBtn.disabled = false;
@@ -9567,19 +9759,22 @@ async function runSmartCascade(targetNode=null){
     const parallelLimit = loopMode === 'parallel' && totalRounds > 1 ? smartCascadeParallelLimit(chain) : 1;
     const precreateSingleSlots = singleNodeLoopRun && loopMode === 'parallel' && totalRounds > 1 && parallelLimit > 1;
     let singleLoopSlots = [];
-    if(singleNodeLoopRun) smartCascadeRunPath = {states:{}};
+    if(singleNodeLoopRun){
+        runState.runPath = {states:{}};
+        smartCascadeRunPath = runState.runPath;
+    }
     if(singleNodeLoopRun){
         singleLoopSlots = Array.from({length:totalRounds}, (_, round) => {
             const loopIndex = startIndex + round * batchSize;
             const slot = loopOutputSlotForRound(tail, loop.node, loopIndex, round);
             return slot ? tagLoopOutputSlot(slot, tail, loop.node, loopIndex, round) : null;
         });
-        singleLoopSlots.filter(Boolean).forEach(slot => { smartCascadeRunPath.states[`${tail.id}->${slot.id}`] = 'wait'; });
+        singleLoopSlots.filter(Boolean).forEach(slot => { runState.runPath.states[`${tail.id}->${slot.id}`] = 'wait'; });
         if(precreateSingleSlots){
             for(let slotOffset = 0; slotOffset < totalRounds; slotOffset++){
                 if(singleLoopSlots[slotOffset]) continue;
                 const loopIndex = startIndex + slotOffset * batchSize;
-                singleLoopSlots[slotOffset] = createLoopOutputSlot(tail, loopIndex, slotOffset, {queued:true, loopNode:loop.node, slotIndex:slotOffset});
+                singleLoopSlots[slotOffset] = createLoopOutputSlot(tail, loopIndex, slotOffset, {queued:true, loopNode:loop.node, slotIndex:slotOffset, runState});
             }
         }
         render();
@@ -9588,21 +9783,22 @@ async function runSmartCascade(targetNode=null){
         const runStates = {};
         if(loop?.node?.id && graph.root?.id) runStates[`${loop.node.id}->${graph.root.id}`] = 'wait';
         graph.edges.forEach(edge => { runStates[edge.key] = 'wait'; });
-        smartCascadeRunPath = {states:runStates};
+        runState.runPath = {states:runStates};
+        smartCascadeRunPath = runState.runPath;
         refreshConnectionLayer();
         updateComposer();
     }
     try {
         const runRound = async (loopIndex=startIndex, options={}) => {
-            throwIfSmartCascadeStopRequested();
-            const ctx = loop ? {index:loopIndex, total:endIndex, nodeId:loop.node.id, forceWorkflow:chain.length > 1 && !singleNodeLoopRun} : null;
+            throwIfSmartCascadeStopRequested(runState);
+            const ctx = loop ? {index:loopIndex, total:endIndex, nodeId:loop.node.id, forceWorkflow:chain.length > 1 && !singleNodeLoopRun, runState} : {runState};
             if(parallelLimit === 1) smartLoopContext = ctx;
             if(singleNodeLoopRun){
                 const refs = refsForDirectLoopRound(loop.node, loopIndex, endIndex);
                 if(directLoopTargetRun && parallelLimit === 1) showDirectLoopRoundPreview(loop.node, tail, refs, loopIndex, endIndex);
                 const slotIndex = Math.max(0, Math.floor((loopIndex - startIndex) / batchSize));
                 const outputTarget = tagLoopOutputSlot(
-                    options.outputTarget || singleLoopSlots[slotIndex] || loopOutputSlotForRound(tail, loop.node, loopIndex, slotIndex) || createLoopOutputSlot(tail, loopIndex, slotIndex, {loopNode:loop.node, slotIndex}),
+                    options.outputTarget || singleLoopSlots[slotIndex] || loopOutputSlotForRound(tail, loop.node, loopIndex, slotIndex) || createLoopOutputSlot(tail, loopIndex, slotIndex, {loopNode:loop.node, slotIndex, runState}),
                     tail,
                     loop.node,
                     loopIndex,
@@ -9614,13 +9810,13 @@ async function runSmartCascade(targetNode=null){
             }
             const producedRefs = new Map();
             const runBranch = async (source, incomingRefs=[]) => {
-                throwIfSmartCascadeStopRequested();
+                throwIfSmartCascadeStopRequested(runState);
                 let targets = graph.children.get(source.id) || [];
                 const loopPrompts = isSmartImageNode(source) ? upstreamLoopPromptNodesFor(source) : [];
                 const sourceLoopPrompts = isSmartImageNode(source) ? relayLoopPromptNodesForTarget(source) : [];
-                if(smartCascadeRunPath && sourceLoopPrompts.length && source?.id){
+                if(runState.runPath && sourceLoopPrompts.length && source?.id){
                     sourceLoopPrompts.forEach(loopNode => {
-                        smartCascadeRunPath.states[`${loopNode.id}->${source.id}`] = 'done';
+                        runState.runPath.states[`${loopNode.id}->${source.id}`] = 'done';
                     });
                     refreshConnectionLayer();
                 }
@@ -9629,15 +9825,15 @@ async function runSmartCascade(targetNode=null){
                     const startBase = Math.max(1, Number(firstLoop.loopStart) || 1);
                     const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
                     const selectedTarget = targets[(currentIndex - 1) % targets.length];
-                    if(smartCascadeRunPath && firstLoop?.id && source?.id){
-                        smartCascadeRunPath.states[`${firstLoop.id}->${source.id}`] = 'done';
+                    if(runState.runPath && firstLoop?.id && source?.id){
+                        runState.runPath.states[`${firstLoop.id}->${source.id}`] = 'done';
                         refreshConnectionLayer();
                     }
                     targets = [selectedTarget].filter(Boolean);
                 }
                 let sharedRefs = incomingRefs;
                 for(let index = 0; index < targets.length; index++){
-                    throwIfSmartCascadeStopRequested();
+                    throwIfSmartCascadeStopRequested(runState);
                     const target = targets[index];
                     const edgeKey = `${source.id}->${target.id}`;
                     let outputs = [];
@@ -9648,14 +9844,14 @@ async function runSmartCascade(targetNode=null){
                         ? {...(ctx || {}), relayPromptNodeIds:[...new Set([...(ctx?.relayPromptNodeIds || []), ...relayLoops.map(n => n.id)])]}
                         : ctx;
                     try {
-                        if(smartCascadeRunPath && relayLoops.length && source?.id && isSmartImageNode(target)){
+                        if(runState.runPath && relayLoops.length && source?.id && isSmartImageNode(target)){
                             relayLoops.forEach(loopNode => {
-                                smartCascadeRunPath.states[`${loopNode.id}->${source.id}`] = 'done';
+                                runState.runPath.states[`${loopNode.id}->${source.id}`] = 'done';
                             });
                             refreshConnectionLayer();
                         }
-                        if(smartCascadeRunPath){
-                            smartCascadeRunPath.states[edgeKey] = 'active';
+                        if(runState.runPath){
+                            runState.runPath.states[edgeKey] = 'active';
                             refreshConnectionLayer();
                         }
                         if(target.type === 'smart-loop'){
@@ -9665,11 +9861,11 @@ async function runSmartCascade(targetNode=null){
                             outputs = await runCascadeStepIntoNode(source, target, incomingRefs, stepCtx);
                             sharedRefs = cascadeRefsFromOutputs(outputs, target);
                         } else {
-                            outputs = appendCascadeRefsToReceiver(target, sharedRefs);
+                            outputs = appendCascadeRefsToReceiver(target, sharedRefs, stepCtx);
                         }
                     } catch(err) {
                         if(/缺少提示词|需要输入文本|need prompt/i.test(err.message || '') && incomingRefs.length){
-                            outputs = appendCascadeRefsToReceiver(target, incomingRefs);
+                            outputs = appendCascadeRefsToReceiver(target, incomingRefs, stepCtx);
                             if(index === 0){
                                 sharedRefs = cascadeRefsFromOutputs(outputs, target);
                             }
@@ -9677,13 +9873,13 @@ async function runSmartCascade(targetNode=null){
                             throw err;
                         }
                     }
-                    if(smartCascadeRunPath){
-                        smartCascadeRunPath.states[edgeKey] = 'done';
+                    if(runState.runPath){
+                        runState.runPath.states[edgeKey] = 'done';
                         refreshConnectionLayer();
                     }
                     const refs = target.type === 'smart-loop' ? sharedRefs : (index === 0 ? sharedRefs : cascadeRefsFromOutputs(outputs, target));
                     producedRefs.set(target.id, refs);
-                    throwIfSmartCascadeStopRequested();
+                    throwIfSmartCascadeStopRequested(runState);
                     await runBranch(target, refs);
                 }
             };
@@ -9700,15 +9896,15 @@ async function runSmartCascade(targetNode=null){
             await runSmartCascadeRoundsWithLimit(roundIndexes, parallelLimit, (loopIndex, roundOffset) => {
                 const outputTarget = parallelTargets[roundOffset] || null;
                 return runRound(loopIndex, {outputTarget});
-            });
+            }, runState);
         } else {
             for(const loopIndex of roundIndexes){
-                throwIfSmartCascadeStopRequested();
+                throwIfSmartCascadeStopRequested(runState);
                 await runRound(loopIndex);
             }
         }
-        throwIfSmartCascadeStopRequested();
-        smartLoopContext = null;
+        throwIfSmartCascadeStopRequested(runState);
+        if(parallelLimit === 1) smartLoopContext = null;
         selectedId = '';
         selectedIds = [];
         selectedImage = {nodeId:'', index:-1};
@@ -9722,18 +9918,16 @@ async function runSmartCascade(targetNode=null){
             ? trf(loopMode === 'parallel' ? 'smart.loopParallelRoundsDone' : 'smart.loopRunRoundsDone', {n:totalRounds})
             : tr('smart.loopRunDone'));
     } catch(e) {
-        smartLoopContext = null;
+        if(parallelLimit === 1) smartLoopContext = null;
         selectedId = originalSelected;
         settings = originalSettings;
         promptInput.innerHTML = originalPromptHtml;
         toast(e?.smartCascadeStopped ? '已停止一键运行' : (e.message || tr('smart.errRunFailed')).slice(0, 160));
     } finally {
-        smartCascadeRunning = false;
-        smartCascadeActiveLoopId = '';
-        smartCascadeStopRequested = false;
+        smartCascadeRuns.delete(runKey);
+        syncSmartCascadeLegacyState();
         smartCascadeSilentSelection = false;
-        smartCascadeRunPath = null;
-        runBtn.disabled = false;
+        runBtn.disabled = smartCascadeAnyRunning();
         cascadeRunBtn.disabled = false;
         if(directLoopTargetRun) finishLoopTargetPreviewState(tail);
         scheduleSave();
@@ -10029,7 +10223,8 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
             enable_upsample: Boolean(runSettings.videoEnableUpsample),
             watermark: Boolean(runSettings.videoWatermark),
             camerafixed: Boolean(runSettings.videoCameraFixed),
-            generate_audio: Boolean(runSettings.videoGenerateAudio)
+            generate_audio: Boolean(runSettings.videoGenerateAudio),
+            multimodal: Boolean(runSettings.videoMultimodal)
         };
         const result = await fetch('/api/canvas-video', {
             method:'POST',
@@ -10666,7 +10861,7 @@ window.onmousemove = e => {
     });
     if(assetLibraryOpen){
         const hit = document.elementFromPoint(e.clientX, e.clientY);
-        if(hit && assetPanel.contains(hit)){
+        if(hit && assetPanel?.contains(hit)){
             setAssetDragOver(true);
             clearDropHighlight();
             setAssetDragOver(true);
@@ -10740,7 +10935,7 @@ window.onmouseup = e => {
         const draggedNode = nodes.find(n => n.id === dragState.id);
         let stateChanged = false;
         const hit = document.elementFromPoint(e.clientX, e.clientY);
-        const droppedOnAssetPanel = assetLibraryOpen && hit && assetPanel.contains(hit);
+        const droppedOnAssetPanel = assetLibraryOpen && hit && assetPanel?.contains(hit);
         if(droppedOnAssetPanel && draggedNode && (draggedNode.images || []).length){
             const imagesToSave = (draggedNode.images || []).filter(img => img?.url);
             imagesToSave.forEach(img => addUrlToAssetLibrary(img.url, img.name || draggedNode.title || 'image'));
@@ -10972,8 +11167,10 @@ if(promptResize){
 }
 runBtn.onclick = runGeneration;
 cascadeRunBtn.onclick = () => {
-    if(smartCascadeRunning) {
-        requestSmartCascadeStop();
+    const node = selectedNode();
+    const loopId = resolveSmartCascadeLoop(node?.id)?.node?.id || '';
+    if(loopId && smartCascadeIsLoopRunning(loopId)) {
+        requestSmartCascadeStop(loopId);
         return;
     }
     runSmartCascade();
@@ -10991,12 +11188,12 @@ fileInput.onchange = () => {
     uploadTargetId = '';
     fileInput.value = '';
 };
-assetToggle.onclick = () => toggleAssetLibrary();
-assetCloseBtn.onclick = () => toggleAssetLibrary(false);
-assetPanel.addEventListener('pointerdown', e => e.stopPropagation());
-assetPanel.addEventListener('mousedown', e => e.stopPropagation());
-assetPanel.addEventListener('click', e => e.stopPropagation());
-assetPanel.addEventListener('wheel', e => {
+if(assetToggle) assetToggle.onclick = () => toggleAssetLibrary();
+if(assetCloseBtn) assetCloseBtn.onclick = () => toggleAssetLibrary(false);
+assetPanel?.addEventListener('pointerdown', e => e.stopPropagation());
+assetPanel?.addEventListener('mousedown', e => e.stopPropagation());
+assetPanel?.addEventListener('click', e => e.stopPropagation());
+assetPanel?.addEventListener('wheel', e => {
     e.stopPropagation();
     const scroller = e.target.closest?.('.asset-grid') || assetGrid;
     if(!scroller || getComputedStyle(scroller).display === 'none') return;
@@ -11006,9 +11203,9 @@ assetPanel.addEventListener('wheel', e => {
     scroller.scrollTop += e.deltaY;
     scroller.scrollLeft += e.deltaX;
 }, {passive:false, capture:true});
-assetDialogBackdrop.addEventListener('pointerdown', e => e.stopPropagation());
-assetDialogBackdrop.addEventListener('mousedown', e => e.stopPropagation());
-assetDialogBackdrop.addEventListener('click', e => e.stopPropagation());
+assetDialogBackdrop?.addEventListener('pointerdown', e => e.stopPropagation());
+assetDialogBackdrop?.addEventListener('mousedown', e => e.stopPropagation());
+assetDialogBackdrop?.addEventListener('click', e => e.stopPropagation());
 promptPresetPanel?.addEventListener('pointerdown', e => e.stopPropagation());
 promptPresetPanel?.addEventListener('mousedown', e => e.stopPropagation());
 promptPresetPanel?.addEventListener('click', e => e.stopPropagation());
@@ -11017,6 +11214,14 @@ promptTemplatePanel?.addEventListener('mousedown', e => e.stopPropagation());
 promptTemplatePanel?.addEventListener('wheel', e => e.stopPropagation(), {passive:false});
 promptTemplatePanel?.addEventListener('click', e => {
     e.stopPropagation();
+    const apply = e.target.closest('[data-template-apply]');
+    if(apply){ applyPromptTemplateToNode(apply.dataset.templateApply || 'positive'); return; }
+    if(e.target.closest('[data-template-save-current]')){ saveCurrentPromptAsTemplate(); return; }
+    if(e.target.closest('[data-template-new]')){ createBlankPromptTemplate(); return; }
+    if(e.target.closest('[data-template-edit]')) { promptTemplateEditing = true; renderPromptTemplatePanel(); return; }
+    if(e.target.closest('[data-template-edit-cancel]')) { promptTemplateEditing = false; renderPromptTemplatePanel(); return; }
+    if(e.target.closest('[data-template-edit-save]')){ savePromptTemplateEdit(); return; }
+    if(e.target.closest('[data-template-delete]')){ deletePromptTemplate(); return; }
     const cat = e.target.closest('[data-template-cat]');
     if(cat){
         promptTemplateCategory = cat.dataset.templateCat || 'all';
@@ -11049,18 +11254,16 @@ promptTemplatePanel?.addEventListener('click', e => {
         renderPromptTemplatePanel();
         return;
     }
-    const apply = e.target.closest('[data-template-apply]');
-    if(apply) applyPromptTemplateToNode(apply.dataset.templateApply || 'positive');
-    if(e.target.closest('[data-template-save-current]')) saveCurrentPromptAsTemplate();
-    if(e.target.closest('[data-template-new]')) createBlankPromptTemplate();
-    if(e.target.closest('[data-template-edit]')) { promptTemplateEditing = true; renderPromptTemplatePanel(); }
-    if(e.target.closest('[data-template-edit-cancel]')) { promptTemplateEditing = false; renderPromptTemplatePanel(); }
-    if(e.target.closest('[data-template-edit-save]')) savePromptTemplateEdit();
-    if(e.target.closest('[data-template-delete]')) deletePromptTemplate();
 });
 if(promptPresetClose) promptPresetClose.onclick = closePromptPresetPanel;
 if(promptTemplateClose) promptTemplateClose.onclick = closePromptTemplatePanel;
 if(promptTemplateSearch) promptTemplateSearch.oninput = () => renderPromptTemplatePanel({preserveScroll:false});
+if(promptTemplateLibrarySelect) promptTemplateLibrarySelect.onchange = () => {
+    activePromptLibraryId = promptTemplateLibrarySelect.value || 'system';
+    promptTemplateSelectedId = '';
+    promptTemplateEditing = false;
+    renderPromptTemplatePanel({preserveScroll:false});
+};
 if(composerTemplateBtn) composerTemplateBtn.onclick = event => {
     event.preventDefault();
     event.stopPropagation();
@@ -11133,15 +11336,23 @@ if(promptPresetDelete) promptPresetDelete.onclick = () => {
 document.querySelectorAll('[data-asset-tab]').forEach(btn => {
     btn.onclick = () => { assetTab = btn.dataset.assetTab; renderAssetLibrary(); };
 });
-assetCategorySelect.onchange = () => { activeAssetCategoryId = assetCategorySelect.value; renderAssetLibrary(); };
-document.getElementById('assetAddCategoryBtn').onclick = async () => {
+if(assetLibrarySelect) assetLibrarySelect.onchange = () => {
+    activeAssetLibraryId = assetLibrarySelect.value || '';
+    activeAssetCategoryId = '';
+    mentionAssetCategoryId = '';
+    renderAssetLibrary();
+};
+if(assetCategorySelect) assetCategorySelect.onchange = () => { activeAssetCategoryId = assetCategorySelect.value; renderAssetLibrary(); };
+const assetAddCategoryBtn = document.getElementById('assetAddCategoryBtn');
+if(assetAddCategoryBtn) assetAddCategoryBtn.onclick = async () => {
     const name = await openAssetNameDialog({title:tr('smart.assetNewFolder'), value:tr('smart.assetFolder'), placeholder:tr('smart.assetFolder')});
     if(!name) return;
-    const data = await fetch('/api/asset-library/categories', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, type:'image'})}).then(r => r.json());
+    const data = await fetch('/api/asset-library/categories', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({library_id:activeAssetLibraryId, name, type:'image'})}).then(r => r.json());
     activeAssetCategoryId = data.category?.id || activeAssetCategoryId;
     setAssetLibraryFromResponse(data);
 };
-document.getElementById('assetRenameCategoryBtn').onclick = async () => {
+const assetRenameCategoryBtn = document.getElementById('assetRenameCategoryBtn');
+if(assetRenameCategoryBtn) assetRenameCategoryBtn.onclick = async () => {
     const cat = activeAssetCategory();
     if(!cat) return;
     const name = await openAssetNameDialog({title:tr('smart.assetRenameFolder'), value:cat.name || '', placeholder:tr('smart.assetFolder')});
@@ -11153,6 +11364,7 @@ function hasCanvasImageDrag(event){
     return Array.from(event.dataTransfer?.types || []).includes('application/x-smart-canvas-image');
 }
 function setAssetDragOver(active){
+    if(!assetDropZone || !assetPanel) return;
     assetDropZone.classList.toggle('drag-over', !!active);
     assetPanel.classList.toggle('drag-over', !!active);
 }
@@ -11195,18 +11407,18 @@ async function handleAssetPanelDrop(e){
         toast(err.message || tr('smart.assetAddFail'));
     }
 }
-assetDropZone.addEventListener('dragover', e => {
+assetDropZone?.addEventListener('dragover', e => {
     if(hasCanvasImageDrag(e) || hasSmartImageDropData(e.dataTransfer)){
         e.preventDefault();
         e.stopPropagation();
-        assetDropZone.classList.add('drag-over');
+        assetDropZone?.classList.add('drag-over');
     }
 });
-assetDropZone.addEventListener('dragleave', () => assetDropZone.classList.remove('drag-over'));
-assetDropZone.addEventListener('drop', handleAssetPanelDrop);
-assetPanel.addEventListener('dragover', handleAssetPanelDragOver);
-assetPanel.addEventListener('dragleave', e => { if(!assetPanel.contains(e.relatedTarget)) setAssetDragOver(false); });
-assetPanel.addEventListener('drop', handleAssetPanelDrop);
+assetDropZone?.addEventListener('dragleave', () => assetDropZone?.classList.remove('drag-over'));
+assetDropZone?.addEventListener('drop', handleAssetPanelDrop);
+assetPanel?.addEventListener('dragover', handleAssetPanelDragOver);
+assetPanel?.addEventListener('dragleave', e => { if(!assetPanel?.contains(e.relatedTarget)) setAssetDragOver(false); });
+assetPanel?.addEventListener('drop', handleAssetPanelDrop);
 createMenu?.addEventListener('mousedown', event => event.stopPropagation());
 createMenu?.addEventListener('click', event => {
     event.stopPropagation();
