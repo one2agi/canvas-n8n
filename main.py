@@ -2048,6 +2048,19 @@ class AssetLibraryBatchDeleteRequest(BaseModel):
     ids: List[str] = []
     library_id: str = ""
 
+class AssetLibraryBatchMoveRequest(BaseModel):
+    ids: List[str] = []
+    library_id: str = ""
+    target_library_id: str = ""
+    target_category_id: str = ""
+
+class AssetLibraryBatchCropRequest(BaseModel):
+    ids: List[str] = []
+    library_id: str = ""
+    target_library_id: str = ""
+    target_category_id: str = ""
+    mode: str = "square"
+
 class PromptLibraryRequest(BaseModel):
     name: str = "提示词库"
 
@@ -2055,7 +2068,7 @@ class PromptLibraryItemRequest(BaseModel):
     library_id: str = ""
     item_id: str = ""
     name: str = "提示词"
-    category: str = "mine"
+    category: str = "custom"
     positive: str = ""
     negative: str = ""
     scene: str = ""
@@ -3601,6 +3614,10 @@ def builtin_prompt_templates():
         print(f"读取提示词模板失败: {e}")
         return []
 
+def normalize_prompt_category_id(category="custom"):
+    category_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(category or "custom"))[:40] or "custom"
+    return "custom" if category_id in {"mine", "my", "personal"} else category_id
+
 def normalize_prompt_library_item(item):
     if not isinstance(item, dict):
         item = {}
@@ -3609,7 +3626,7 @@ def normalize_prompt_library_item(item):
     return {
         "id": re.sub(r"[^A-Za-z0-9_-]+", "_", str(item.get("id") or item.get("item_id") or f"tpl_{uuid.uuid4().hex[:12]}"))[:60],
         "name": name,
-        "category": re.sub(r"[^A-Za-z0-9_-]+", "_", str(item.get("category") or "mine"))[:40] or "mine",
+        "category": normalize_prompt_category_id(item.get("category") or "custom"),
         "scene": str(item.get("scene") or "").strip()[:500],
         "positive": positive,
         "negative": str(item.get("negative") or "").strip(),
@@ -3618,12 +3635,19 @@ def normalize_prompt_library_item(item):
         "updated_at": int(item.get("updated_at") or item.get("created_at") or now_ms()),
     }
 
+def seed_system_prompt_library():
+    return {
+        "id": "system",
+        "name": "系统提示词库",
+        "type": "prompt",
+        "items": builtin_prompt_templates(),
+        "categories": defaultPromptTemplateCategories(),
+    }
+
 def default_prompt_libraries():
     return {
-        "active_library_id": "mine",
-        "libraries": [
-            {"id": "mine", "name": "我的提示词库", "type": "prompt", "items": [], "categories": defaultPromptTemplateCategories()},
-        ],
+        "active_library_id": "system",
+        "libraries": [seed_system_prompt_library()],
         "updated_at": now_ms(),
     }
 
@@ -3634,8 +3658,30 @@ def defaultPromptTemplateCategories():
         {"id": "character", "name": "角色"},
         {"id": "product", "name": "产品"},
         {"id": "lighting", "name": "光影"},
-        {"id": "mine", "name": "我的"},
+        {"id": "custom", "name": "自定义"},
     ]
+
+def normalize_prompt_template_categories(*category_lists):
+    normalized = []
+    seen = set()
+
+    def add_category(category):
+        if not isinstance(category, dict):
+            return
+        cat_id = normalize_prompt_category_id(category.get("id") or category.get("name") or "custom")
+        if cat_id in seen:
+            return
+        seen.add(cat_id)
+        name = "自定义" if cat_id == "custom" else sanitize_asset_name(category.get("name") or cat_id, cat_id)
+        normalized.append({"id": cat_id, "name": name})
+
+    for category in defaultPromptTemplateCategories():
+        add_category(category)
+    for categories in category_lists:
+        if isinstance(categories, list):
+            for category in categories:
+                add_category(category)
+    return normalized
 
 def normalize_prompt_libraries(data):
     if not isinstance(data, dict):
@@ -3643,44 +3689,57 @@ def normalize_prompt_libraries(data):
     libraries = data.get("libraries") if isinstance(data.get("libraries"), list) else []
     if not libraries:
         libraries = default_prompt_libraries()["libraries"]
-    normalized = []
-    seen = set()
+    system_source = next((item for item in libraries if isinstance(item, dict) and item.get("id") == "system"), None)
+    source = system_source if isinstance(system_source, dict) else seed_system_prompt_library()
+    category_lists = [source.get("categories") if isinstance(source.get("categories"), list) else []]
+    items = []
+    seen_items = set()
+
+    def append_items(raw_items):
+        if not isinstance(raw_items, list):
+            return
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            item = normalize_prompt_library_item(raw_item)
+            item_id = item.get("id") or f"tpl_{uuid.uuid4().hex[:12]}"
+            if item_id in seen_items:
+                continue
+            seen_items.add(item_id)
+            items.append(item)
+
+    append_items(source.get("items") if isinstance(source, dict) else [])
     for library in libraries:
         if not isinstance(library, dict):
             continue
-        lib_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(library.get("id") or f"plib_{uuid.uuid4().hex[:10]}"))[:40] or f"plib_{uuid.uuid4().hex[:10]}"
-        if lib_id == "system":
-            lib_id = f"plib_{uuid.uuid4().hex[:10]}"
-        if lib_id in seen:
-            lib_id = f"{lib_id}_{uuid.uuid4().hex[:4]}"
-        seen.add(lib_id)
-        categories = library.get("categories") if isinstance(library.get("categories"), list) else defaultPromptTemplateCategories()
-        normalized.append({
-            "id": lib_id,
-            "name": sanitize_asset_name(library.get("name") or "提示词库", "提示词库"),
-            "type": "prompt",
-            "readonly": False,
-            "categories": categories,
-            "items": [normalize_prompt_library_item(item) for item in (library.get("items") if isinstance(library.get("items"), list) else []) if isinstance(item, dict)],
-        })
-    if not normalized:
-        normalized = default_prompt_libraries()["libraries"]
-    active = str(data.get("active_library_id") or normalized[0]["id"])
-    if not any(item["id"] == active for item in normalized):
-        active = normalized[0]["id"]
-    return {"active_library_id": active, "libraries": normalized, "updated_at": int(data.get("updated_at") or now_ms())}
+        category_lists.append(library.get("categories") if isinstance(library.get("categories"), list) else [])
+        if library.get("id") != "system":
+            append_items(library.get("items") if isinstance(library.get("items"), list) else [])
+    system_library = {
+        "id": "system",
+        "name": sanitize_asset_name(source.get("name") or "系统提示词库", "系统提示词库"),
+        "type": "prompt",
+        "readonly": False,
+        "categories": normalize_prompt_template_categories(*category_lists),
+        "items": items,
+    }
+    return {"active_library_id": "system", "libraries": [system_library], "updated_at": int(data.get("updated_at") or now_ms())}
 
 def load_prompt_libraries():
     if not os.path.exists(PROMPT_LIBRARY_PATH):
         data = default_prompt_libraries()
-        save_prompt_libraries(data)
-        return data
+        return save_prompt_libraries(data)
     try:
         with open(PROMPT_LIBRARY_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         data = default_prompt_libraries()
-    return normalize_prompt_libraries(data)
+    if not isinstance(data, dict):
+        data = default_prompt_libraries()
+    normalized = normalize_prompt_libraries(data)
+    if normalized.get("active_library_id") != data.get("active_library_id") or normalized.get("libraries") != data.get("libraries"):
+        return save_prompt_libraries(normalized)
+    return normalized
 
 def save_prompt_libraries(data):
     data = normalize_prompt_libraries(data)
@@ -3692,17 +3751,9 @@ def save_prompt_libraries(data):
 
 def public_prompt_libraries(data=None):
     data = normalize_prompt_libraries(data or load_prompt_libraries())
-    system_library = {
-        "id": "system",
-        "name": "系统提示词库",
-        "type": "prompt",
-        "readonly": True,
-        "categories": defaultPromptTemplateCategories(),
-        "items": builtin_prompt_templates(),
-    }
     return {
-        "active_library_id": data.get("active_library_id") or "mine",
-        "libraries": [system_library, *(data.get("libraries") or [])],
+        "active_library_id": data.get("active_library_id") or (data.get("libraries") or [{}])[0].get("id") or "system",
+        "libraries": data.get("libraries") or [],
         "updated_at": data.get("updated_at") or now_ms(),
     }
 
@@ -4476,7 +4527,18 @@ GPT_IMAGE2_MAX_PIXELS = 8_294_400
 GPT_IMAGE2_MIN_PIXELS = 655_360
 
 def is_gpt_image_2_model(model):
-    return str(model or "").strip().lower() == "gpt-image-2"
+    raw = str(model or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    compact = re.sub(r"[^a-z0-9]+", "", raw)
+    return (
+        normalized == "gpt-image-2"
+        or normalized.startswith("gpt-image-2-")
+        or normalized.endswith("-gpt-image-2")
+        or "-gpt-image-2-" in normalized
+        or compact == "gptimage2"
+        or compact.startswith("gptimage2")
+        or compact.endswith("gptimage2")
+    )
 
 def normalize_gpt_image_2_size(size):
     width, height = parse_size_pair(size)
@@ -4501,6 +4563,30 @@ def normalize_gpt_image_2_size(size):
         width = int((width * grow + 15) // 16) * 16
         height = int((height * grow + 15) // 16) * 16
     return f"{width}x{height}"
+
+def gpt_image_2_size_error_message(size):
+    width, height = parse_size_pair(size)
+    display_size = size or "未指定"
+    if width == 4096 and height == 4096:
+        return (
+            "GPT-Image-2 不支持 4K 1:1 的 4096x4096。"
+            "如果需要输出 4096x4096，请切换到 nano-banana；"
+            "如果继续使用 GPT，请改成 2K 或长边不超过 3840、总像素不超过约 829 万的尺寸。"
+        )
+    if width and height and (max(width, height) > GPT_IMAGE2_MAX_EDGE or width * height > GPT_IMAGE2_MAX_PIXELS):
+        return (
+            f"GPT-Image-2 不支持当前尺寸 {display_size}。"
+            "该尺寸超过 GPT 支持范围；如果要保留这个高分辨率，请切换到 nano-banana，"
+            "或把 GPT 尺寸改成 2K / 3840x2160 / 2160x3840 这类更小规格。"
+        )
+    return (
+        f"GPT-Image-2 不支持当前尺寸 {display_size}。"
+        "请换成 GPT 支持的分辨率，或切换到 nano-banana 生成更高分辨率。"
+    )
+
+def gpt_image_2_size_exceeds_supported(size):
+    width, height = parse_size_pair(size)
+    return bool(width and height and (max(width, height) > GPT_IMAGE2_MAX_EDGE or width * height > GPT_IMAGE2_MAX_PIXELS))
 
 def apimart_size_resolution(size):
     width, height = parse_size_pair(size)
@@ -4587,7 +4673,20 @@ def normalize_volcengine_size(size, model=""):
 def friendly_image_error_detail(text, size="", model=""):
     text = str(text or "")
     lower_text = text.lower()
+    if is_gpt_image_2_model(model) and gpt_image_2_size_exceeds_supported(size):
+        return gpt_image_2_size_error_message(size)
+    mentions_size = any(token in lower_text for token in ["size", "resolution", "dimension"])
+    is_gpt_size_error = is_gpt_image_2_model(model) and mentions_size and (
+        "invalid" in lower_text
+        or "unsupported" in lower_text
+        or "not supported" in lower_text
+        or "exceed" in lower_text
+        or "must be one of" in lower_text
+    )
     m = re.search(r"longest edge must be less than or equal to (\d+)", text)
+    if m and is_gpt_image_2_model(model):
+        limit = m.group(1)
+        return f"GPT-Image-2 不支持当前尺寸 {size or '未指定'}：最长边超过 {limit}px。如果需要更高分辨率，请切换到 nano-banana；继续使用 GPT 时请调低分辨率。"
     if m:
         limit = m.group(1)
         return f"该模型不支持当前分辨率：最长边超过 {limit}px。请把图片分辨率调低（例如换到 2K 或更小），或更换支持高分辨率的模型。"
@@ -4595,6 +4694,8 @@ def friendly_image_error_detail(text, size="", model=""):
         pixel_match = re.search(r"at least (\d+) pixels", lower_text)
         pixels = pixel_match.group(1) if pixel_match else "3686400"
         return f"该模型要求更高分辨率，当前尺寸 {size or '过小'} 不满足最低像素要求（至少 {pixels} 像素）。火山 Seedream 5.0 建议从 2K 起步。"
+    if is_gpt_size_error or (("invalid size" in lower_text or "invalid_value" in lower_text) and is_gpt_image_2_model(model)):
+        return gpt_image_2_size_error_message(size)
     if "invalid size" in lower_text or "invalid_value" in lower_text:
         return f"该模型不支持当前尺寸：{size or '未指定'}。请尝试更换分辨率或模型。"
     if "inputtextsensitivecontentdetected" in lower_text or "policyviolation" in lower_text or "copyright restrictions" in lower_text:
@@ -5134,8 +5235,6 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     quality = str(quality or "").strip().lower()
     if quality not in {"low", "medium", "high"}:
         quality = ""
-    if is_gpt_image_2_model(model) and not is_apimart:
-        size = normalize_gpt_image_2_size(size)
     base_url = (provider.get("base_url") or AI_BASE_URL).rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
@@ -6930,19 +7029,7 @@ async def get_prompt_libraries():
 
 @app.post("/api/prompt-libraries")
 async def create_prompt_library(payload: PromptLibraryRequest):
-    data = load_prompt_libraries()
-    library = {
-        "id": f"plib_{uuid.uuid4().hex[:12]}",
-        "name": sanitize_asset_name(payload.name, "提示词库"),
-        "type": "prompt",
-        "readonly": False,
-        "categories": defaultPromptTemplateCategories(),
-        "items": [],
-    }
-    data.setdefault("libraries", []).append(library)
-    data["active_library_id"] = library["id"]
-    data = save_prompt_libraries(data)
-    return {"library": public_prompt_libraries(data), "prompt_library": library}
+    raise HTTPException(status_code=400, detail="提示词库已合并为系统提示词库，请直接在系统提示词库中新增提示词")
 
 @app.patch("/api/prompt-libraries/{library_id}")
 async def rename_prompt_library(library_id: str, payload: PromptLibraryRequest):
@@ -6956,17 +7043,7 @@ async def rename_prompt_library(library_id: str, payload: PromptLibraryRequest):
 
 @app.delete("/api/prompt-libraries/{library_id}")
 async def delete_prompt_library(library_id: str):
-    data = load_prompt_libraries()
-    libraries = data.get("libraries") or []
-    if len(libraries) <= 1:
-        raise HTTPException(status_code=400, detail="至少保留一个提示词库")
-    if not any(item.get("id") == library_id for item in libraries):
-        raise HTTPException(status_code=404, detail="提示词库不存在")
-    data["libraries"] = [item for item in libraries if item.get("id") != library_id]
-    if data.get("active_library_id") == library_id:
-        data["active_library_id"] = data["libraries"][0].get("id")
-    data = save_prompt_libraries(data)
-    return {"library": public_prompt_libraries(data)}
+    raise HTTPException(status_code=400, detail="系统提示词库不能删除，可以删除其中的提示词")
 
 @app.post("/api/prompt-libraries/items")
 async def add_prompt_library_item(payload: PromptLibraryItemRequest):
@@ -7203,6 +7280,91 @@ async def batch_delete_asset_library_items(payload: AssetLibraryBatchDeleteReque
             cat["items"] = keep
     save_asset_library(lib)
     return {"library": lib, "removed": removed}
+
+@app.post("/api/asset-library/items/move")
+async def batch_move_asset_library_items(payload: AssetLibraryBatchMoveRequest):
+    ids = {str(item) for item in (payload.ids or []) if str(item)}
+    if not ids:
+        raise HTTPException(status_code=400, detail="没有选择资产")
+    lib = load_asset_library()
+    target_cat = find_asset_category_in_library(lib, payload.target_category_id, payload.target_library_id)
+    if not target_cat:
+        raise HTTPException(status_code=404, detail="目标分组不存在")
+    if target_cat.get("type") != "image":
+        raise HTTPException(status_code=400, detail="目标分组不支持媒体")
+    moved = []
+    for library in lib.get("libraries", []):
+        if payload.library_id and library.get("id") != payload.library_id:
+            continue
+        for cat in library.get("categories", []):
+            keep = []
+            for item in cat.get("items", []):
+                if item.get("id") in ids:
+                    moved.append(item)
+                else:
+                    keep.append(item)
+            cat["items"] = keep
+    existing_ids = {item.get("id") for item in target_cat.get("items", [])}
+    for item in moved:
+        if item.get("id") not in existing_ids:
+            target_cat.setdefault("items", []).append(item)
+            existing_ids.add(item.get("id"))
+    save_asset_library(lib)
+    return {"library": lib, "moved": len(moved)}
+
+@app.post("/api/asset-library/items/crop")
+async def batch_crop_asset_library_items(payload: AssetLibraryBatchCropRequest):
+    ids = {str(item) for item in (payload.ids or []) if str(item)}
+    if not ids:
+        raise HTTPException(status_code=400, detail="没有选择资产")
+    lib = load_asset_library()
+    target_cat = None
+    if payload.target_category_id:
+        target_cat = find_asset_category_in_library(lib, payload.target_category_id, payload.target_library_id)
+        if not target_cat:
+            raise HTTPException(status_code=404, detail="目标分组不存在")
+        if target_cat.get("type") != "image":
+            raise HTTPException(status_code=400, detail="目标分组不支持媒体")
+    added = []
+    for library in lib.get("libraries", []):
+        if payload.library_id and library.get("id") != payload.library_id:
+            continue
+        for cat in library.get("categories", []):
+            if cat.get("type") != "image":
+                continue
+            source_items = [item for item in (cat.get("items", []) or []) if item.get("id") in ids]
+            for item in source_items:
+                src = output_file_from_url(item.get("url") or "")
+                if not src or not os.path.isfile(src):
+                    continue
+                try:
+                    with Image.open(src) as img:
+                        img = img.convert("RGBA")
+                        w, h = img.size
+                        side = min(w, h)
+                        if side <= 0:
+                            continue
+                        left = max(0, (w - side) // 2)
+                        top = max(0, (h - side) // 2)
+                        cropped = img.crop((left, top, left + side, top + side))
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                        tmp_path = tmp.name
+                        tmp.close()
+                        try:
+                            cropped.save(tmp_path, "PNG")
+                            base_name = os.path.splitext(item.get("name") or "asset")[0] + "_crop.png"
+                            _, next_item = make_asset_library_item(tmp_path, base_name)
+                            (target_cat or cat).setdefault("items", []).append(next_item)
+                            added.append(next_item)
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+    save_asset_library(lib)
+    return {"library": lib, "added": len(added), "items": added}
 
 @app.put("/api/canvases/{canvas_id}")
 async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
@@ -8622,4 +8784,3 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=3000)
-

@@ -63,6 +63,7 @@ let selectedImage = {nodeId:'', index:-1};
 let dragState = null;
 let loopInsertPreview = null;
 let selectionState = null;
+let isRKeyDown = false;
 let selectionJustFinished = false;
 let resizeState = null;
 let thumbDragState = null;
@@ -323,7 +324,7 @@ const MS_GEN_MODELS = {
     custom: { label:tr('smart.custom') || '自定义', modelId:'', acceptsImage:true, endpoint:'/api/ms/generate' }
 };
 const SIZE_MAP = {
-    square: {'1k':'1024x1024','2k':'2048x2048','4k':'2048x2048'},
+    square: {'1k':'1024x1024','2k':'2048x2048','4k':'4096x4096'},
     landscape: {'1k':'1536x1024','2k':'2048x1360','4k':'3520x2336'},
     portrait: {'1k':'1024x1536','2k':'1360x2048','4k':'2336x3520'},
     landscape43: {'1k':'1024x768','2k':'2048x1536','4k':'3312x2480'},
@@ -1673,7 +1674,7 @@ function msModelLabel(key){
 }
 function renderMsFunctionControl(){
     return `<div class="smart-control provider-control">
-        <button class="smart-pill" type="button"><i data-lucide="sparkles"></i><span class="sub">${escapeHtml(msModelLabel(settings.msgenModel) || 'ModelScope')}</span></button>
+        <button class="smart-pill" type="button"><i data-lucide="sparkles"></i><span class="sub">${escapeHtml(msModelLabel(settings.msgenModel) || 'Modelscope')}</span></button>
         <div class="smart-popover compact-popover">
             <div class="smart-popover-title">${escapeHtml(tr('smart.msFunction'))}</div>
             <div class="model-list">
@@ -4135,7 +4136,7 @@ function smartRunTaskLabel(run){
         return labels[s.comfyMode || 'text'] || 'ComfyUI';
     }
     if(s.engine === 'modelscope'){
-        return s.msgenModel === 'custom' ? (s.msCustomModel || 'ModelScope') : (MS_GEN_MODELS[s.msgenModel]?.label || s.msgenModel || 'ModelScope');
+        return s.msgenModel === 'custom' ? (s.msCustomModel || 'Modelscope') : (MS_GEN_MODELS[s.msgenModel]?.label || s.msgenModel || 'Modelscope');
     }
     return s.model || 'API Image';
 }
@@ -4262,14 +4263,14 @@ async function downloadPreviewGroup(){
 function smartRunPlatformLabel(run){
     const s = run?.settings || {};
     if(s.engine === 'comfy') return 'ComfyUI';
-    if(s.engine === 'modelscope') return 'ModelScope';
+    if(s.engine === 'modelscope') return 'Modelscope';
     if(run?.kind === 'video') return videoProviderById(s.videoProvider || '')?.name || s.videoProvider || 'Video';
     return apiProviderById(s.provider_id || '')?.name || s.provider_id || 'API';
 }
 function smartRunRequestMeta(run){
     const s = run?.settings || {};
     if(s.engine === 'comfy') return {workflow_json:s.comfyWorkflow || '', mode:s.comfyMode || 'text'};
-    if(s.engine === 'modelscope') return {backend:'ModelScope', model:s.msgenModel || '', custom_model:s.msCustomModel || ''};
+    if(s.engine === 'modelscope') return {backend:'Modelscope', model:s.msgenModel || '', custom_model:s.msCustomModel || ''};
     if(run?.kind === 'video') return {provider_id:s.videoProvider || '', model:s.videoModel || '', duration:s.videoDuration || '', aspect_ratio:s.videoAspect || '', resolution:s.videoResolution || ''};
     return {provider_id:s.provider_id || '', model:s.model || '', size:run?.size || '', quality:s.quality || '', n:s.count || 1};
 }
@@ -7150,9 +7151,6 @@ function openImageEditor(nodeId, imageIndex=0){
         updateZoomLabel(); resizeEditDrawCanvas(); resetEditDrawingHistory(); clearEditDrawing(true); resetCropBox();
         if(!imageEditModeTouched) setImageEditMode('preview');
         else refreshComparePanel();
-        if(imageEditMode === 'preview' && isLikelyPanoramaImage(node, targetImage || image, img.naturalWidth, img.naturalHeight)){
-            setPanoramaEnabled(true);
-        }
         if(!panoramaState.enabled) updatePreviewMetaHint();
         syncImageEditOverflow(); refreshIcons();
     };
@@ -8417,15 +8415,24 @@ function textBeforeCaret(){
 function renderMentionPicker(source){
     const node = selectedNode();
     const inputItems = inputMentionCandidateImages(node);
+    const assetLibs = assetLibraries();
+    if(!activeAssetLibraryId || !assetLibs.some(lib => lib.id === activeAssetLibraryId)) activeAssetLibraryId = assetLibrary.active_library_id || assetLibs[0]?.id || '';
+    const libraryWithMentionAssets = assetLibs.find(lib => (lib.categories || []).some(cat => (cat.type || 'image') === 'image' && (cat.items || []).some(item => item?.url)));
     const assetCats = assetCategories('image');
-    const currentAssetCat = assetCategoryForMention();
-    const assetItems = assetMentionCandidateImages(currentAssetCat?.id || '');
     const hasInput = inputItems.length > 0;
-    const hasAssets = assetCats.some(cat => (cat.items || []).some(item => item?.url));
+    const hasAssets = Boolean(libraryWithMentionAssets);
     mentionSource = source || (hasInput ? 'input' : 'asset');
+    if(mentionSource === 'asset' && hasAssets && !assetCats.some(cat => (cat.items || []).some(item => item?.url)) && libraryWithMentionAssets){
+        activeAssetLibraryId = libraryWithMentionAssets.id;
+        activeAssetCategoryId = '';
+        mentionAssetCategoryId = '';
+    }
     if(mentionSource === 'input' && !hasInput && hasAssets) mentionSource = 'asset';
     if(mentionSource === 'asset' && !hasAssets && hasInput) mentionSource = 'input';
     if(!hasInput && !hasAssets){ closeMentionPicker(); return; }
+    const nextAssetCats = assetCategories('image');
+    const currentAssetCat = assetCategoryForMention();
+    const assetItems = assetMentionCandidateImages(currentAssetCat?.id || '');
     const candidates = (mentionSource === 'asset' ? assetItems : inputItems).slice(0, 36);
     const body = candidates.length ? `<div class="mention-option-grid">${candidates.map((img, i) => `
             <button class="mention-option" type="button" data-mention-index="${i}">
@@ -8433,8 +8440,11 @@ function renderMentionPicker(source){
                 <span>${escapeHtml(img.alias)}</span>
             </button>
         `).join('')}</div>` : `<div class="mention-empty">${escapeHtml(tr('smart.mentionEmpty'))}</div>`;
-    const folderChips = (mentionSource === 'asset' && assetCats.length)
-        ? assetCats.map(cat => {
+    const librarySelect = (mentionSource === 'asset' && assetLibs.length)
+        ? `<label class="mention-library-row"><span>${escapeHtml(tr('smart.assetLibrary'))}</span><select class="mention-library-select" data-mention-library>${assetLibs.map(lib => `<option value="${escapeHtml(lib.id)}" ${lib.id === activeAssetLibraryId ? 'selected' : ''}>${escapeHtml(lib.name || '资产库')}</option>`).join('')}</select></label>`
+        : '';
+    const folderChips = (mentionSource === 'asset' && nextAssetCats.length)
+        ? nextAssetCats.map(cat => {
             const label = cat.name || tr('smart.assetFolder');
             return `<button class="mention-folder-chip ${cat.id === mentionAssetCategoryId ? 'active' : ''}" type="button" data-mention-folder="${escapeHtml(cat.id)}" title="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
           }).join('')
@@ -8449,6 +8459,7 @@ function renderMentionPicker(source){
                     <i data-lucide="library"></i><span>${escapeHtml(tr('smart.mentionAssets'))}</span>
                 </button>
             </div>
+            ${librarySelect}
             <div class="mention-folder-chips ${folderChips ? '' : 'hidden'}">
                 ${folderChips}
             </div>
@@ -8465,6 +8476,16 @@ function renderMentionPicker(source){
             e.preventDefault(); e.stopPropagation();
             if(btn.disabled) return;
             renderMentionPicker(btn.dataset.mentionSource);
+        });
+    });
+    mentionPicker.querySelectorAll('[data-mention-library]').forEach(select => {
+        select.addEventListener('mousedown', e => e.stopPropagation());
+        select.addEventListener('change', e => {
+            activeAssetLibraryId = e.target.value || '';
+            activeAssetCategoryId = '';
+            mentionAssetCategoryId = '';
+            renderAssetLibrary();
+            renderMentionPicker('asset');
         });
     });
     mentionPicker.querySelectorAll('[data-mention-folder]').forEach(btn => {
@@ -10744,7 +10765,14 @@ shell.onmousedown = e => {
     if(zoomPreviewState && e.button === 0 && !e.target.closest('.composer,.smart-back,.asset-panel,.asset-toggle,.smart-log-toggle,.smart-shortcut-toggle,.log-modal,.shortcut-modal,.image-edit-modal,.create-menu,.smart-minimap')) return;
     if(e.target.closest('.image-node,.composer,.smart-back,.smart-log-toggle,.smart-shortcut-toggle,.log-modal,.shortcut-modal,.create-menu,.smart-minimap')) return;
     closeCreateMenu();
-    if(e.button === 0 && e.ctrlKey){
+    if(e.button === 0 && isRKeyDown){
+        e.preventDefault();
+        didPan = false;
+        selectionState = {startScreen:{x:e.clientX, y:e.clientY}, startWorld:screenToWorld(e)};
+        updateSelectionBox(e);
+        return;
+    }
+    if(e.button === 0 && (e.ctrlKey || e.metaKey)){
         e.preventDefault();
         didPan = false;
         selectionState = {startScreen:{x:e.clientX, y:e.clientY}, startWorld:screenToWorld(e)};
@@ -10756,6 +10784,13 @@ shell.onmousedown = e => {
     didPan = false;
     panState = {button:e.button, startX:e.clientX, startY:e.clientY, ox:viewport.x, oy:viewport.y};
     shell.classList.add('panning');
+};
+shell.oncontextmenu = e => {
+    if((e.ctrlKey || e.metaKey) || isRKeyDown){
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+    }
 };
 shell.ondblclick = e => {
     if(didPan || e.target.closest('.image-node,.composer,.smart-back,.smart-log-toggle,.smart-shortcut-toggle,.log-modal,.shortcut-modal,.image-edit-modal,.create-menu')) return;
@@ -11137,6 +11172,7 @@ window.addEventListener('paste', e => {
 });
 window.addEventListener('keydown', e => {
     const key = String(e.key || '').toLowerCase();
+    if(key === 'r' && !isEditableTarget(e.target)) isRKeyDown = true;
     if(imageEditModal.classList.contains('open') && !isEditableTarget(e.target)){
         if(e.key === 'ArrowLeft' || e.key === 'ArrowRight'){
             e.preventDefault();
@@ -11192,16 +11228,22 @@ window.addEventListener('keydown', e => {
         render();
         scheduleSave();
     }
-    if(e.ctrlKey && e.shiftKey && key === 'g' && !isEditableTarget(e.target)){
+    if((e.ctrlKey || e.metaKey) && e.shiftKey && key === 'g' && !isEditableTarget(e.target)){
         e.preventDefault();
         const ids = selectedIds.length ? selectedIds.slice() : (selectedId ? [selectedId] : []);
         const ok = ids.map(id => ungroupNode(id)).some(Boolean);
         if(ok) return;
     }
-    if(e.ctrlKey && String(e.key).toLowerCase() === 'g' && !e.shiftKey && !isEditableTarget(e.target)){
+    if((e.ctrlKey || e.metaKey) && key === 'g' && !e.shiftKey && !isEditableTarget(e.target)){
         e.preventDefault();
         groupSelectedNodes();
     }
+});
+window.addEventListener('keyup', e => {
+    if(String(e.key || '').toLowerCase() === 'r') isRKeyDown = false;
+});
+window.addEventListener('blur', () => {
+    isRKeyDown = false;
 });
 engineSelect.onchange = () => {
     settings.engine = engineSelect.value;
