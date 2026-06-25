@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "project": {
+    "name": "Infinite-Canvas",
+    "version": "2026.06.25",
+    "author": "hero8152",
+    "repository": "https://github.com/hero8152/Infinite-Canvas",
+    "description": "无限画布 — 集成 ComfyUI / 多家 LLM API / Modelscope / RunningHub / 即梦 / 火山引擎的 AI 图像/视频生成前端",
+    "tagline": "Supports comfyui/API calls/modelscope calls",
+    "license": {
+      "type": "custom",
+      "commercial_use": false,
+      "personal_use": true,
+      "modification_resale": false,
+      "derivative_must_be_open_source": true,
+      "credit_required": true,
+      "notes": "已申请著作权，禁止商业用途；二次开发必须开源并注明原作者"
+    },
+    "language": {
+      "primary": ["python", "javascript"],
+      "python_version": "3.10",
+      "frontend": "vanilla-js",
+      "no_framework": true
+    },
+    "stats": {
+      "main_py_lines": 15073,
+      "main_py_size_bytes": 690126,
+      "canvas_js_size_bytes": 666797,
+      "smart_canvas_js_size_bytes": 831043,
+      "total_python_files": 2,
+      "total_workflows": 7,
+      "total_offline_packages": 23,
+      "total_languages_i18n": 7,
+      "has_tests": false
+    }
+  },
+  "entry_points": [
+    {
+      "type": "backend",
+      "path": "main.py",
+      "framework": "FastAPI",
+      "host": "127.0.0.1",
+      "port": 3000,
+      "description": "单体 FastAPI 应用，所有 API 与 WebSocket 路由"
+    },
+    {
+      "type": "launcher",
+      "os": "windows",
+      "path": "run.bat",
+      "uses": "python/python.exe (bundled Python 3.10)"
+    },
+    {
+      "type": "launcher",
+      "os": "macos",
+      "path": "mac-启动服务.command"
+    },
+    {
+      "type": "launcher",
+      "os": "macos",
+      "path": "mac-启动服务.sh"
+    },
+    {
+      "type": "installer",
+      "os": "cross",
+      "paths": ["安装依赖.bat", "mac-安装依赖.sh", "安装即梦CLI.bat"]
+    }
+  ],
+  "core_modules": [
+    {
+      "name": "Application Bootstrap",
+      "lines": "180-700",
+      "key_functions": ["startup_event", "ensure_runtime_config_files", "load_env_file"],
+      "routes": []
+    },
+    {
+      "name": "API Provider Manager",
+      "lines": "560-1110",
+      "key_functions": ["model_list", "reload_env_globals", "default_api_providers", "merge_default_api_providers", "normalize_endpoint_override"],
+      "routes": []
+    },
+    {
+      "name": "Update Mechanism",
+      "lines": "1784-2270",
+      "routes": ["/api/update-connectivity/probe", "/api/update-connectivity", "/api/check-update", "/api/update-from-github", "/api/update-backups", "/api/update-rollback"]
+    },
+    {
+      "name": "Jimeng CLI",
+      "lines": "4156",
+      "exception": "JimengPendingError",
+      "description": "即梦 CLI 任务队列管理"
+    },
+    {
+      "name": "Media Preview",
+      "lines": "4761-4830",
+      "routes": ["/api/media-preview", "/api/image-jpeg"]
+    },
+    {
+      "name": "View Layer",
+      "lines": "9006-9100",
+      "routes": ["/", "/api/view", "/api/download-output"]
+    },
+    {
+      "name": "Upload Handlers",
+      "lines": "9080-9200",
+      "routes": ["/api/upload", "/api/ai/upload", "/api/ai/upload-base64", "/api/comfyui/upload-base64"]
+    },
+    {
+      "name": "Local Assets Library",
+      "lines": "9488-9819",
+      "routes": [
+        "/api/local-assets/upload", "/api/local-assets/import-urls", "/api/local-assets",
+        "/api/local-assets/folders", "/api/local-assets/items",
+        "/api/local-assets/delete", "/api/local-assets/move",
+        "/api/local-assets/caption", "/api/local-assets/classify"
+      ]
+    },
+    {
+      "name": "RunningHub Integration",
+      "lines": "9839-10000",
+      "routes": [
+        "/api/runninghub/app-info", "/api/runninghub/submit",
+        "/api/runninghub/workflow-submit", "/api/runninghub/workflow-info",
+        "/api/runninghub/workflows", "/api/runninghub/workflows/{workflow_id}"
+      ]
+    },
+    {
+      "name": "WebSocket Stats",
+      "lines": "200",
+      "routes": ["/ws/stats"]
+    }
+  ],
+  "dependencies": {
+    "python": {
+      "requirements_txt": ["fastapi", "uvicorn", "requests", "pydantic", "python-multipart", "httpx", "pillow"],
+      "offline_packages": [
+        "annotated_doc-0.0.4", "annotated_types-0.7.0", "anyio-4.13.0",
+        "certifi-2026.4.22", "charset_normalizer-3.4.7", "click-8.3.3",
+        "colorama-0.4.6", "fastapi-0.136.1", "h11-0.16.0",
+        "httpcore-1.0.9", "httpx-0.28.1", "idna-3.13",
+        "pillow-12.2.0", "pydantic-2.13.4", "pydantic_core-2.46.4",
+        "python_multipart-0.0.27", "requests-2.33.1", "starlette-1.0.0",
+        "typing_extensions-4.15.0", "typing_inspection-0.4.2",
+        "urllib3-2.7.0", "uvicorn-0.46.0"
+      ]
+    },
+    "frontend": {
+      "framework": "vanilla-js",
+      "build_tool": "none",
+      "css_files": ["api-settings.css", "asset-manager.css", "canvas-list.css", "canvas.css", "comfyui-settings.css", "smart-canvas.css", "theme.css"],
+      "js_modules": [
+        "canvas.js (主画布)", "smart-canvas.js (智能画布)", "asset-manager.js",
+        "api-settings.js", "comfyui-settings.js", "canvas-list.js",
+        "history-bulk-manager.js", "image-preview.js",
+        "ltx-director-timeline.js", "theme.js", "i18n.js"
+      ]
+    },
+    "bundled_runtime": {
+      "python_dir": "python/",
+      "platform": "Windows CP314 (cp3.14 win_amd64)",
+      "version": "3.10",
+      "components": ["python.exe", "python310.dll", "python310.zip", "libcrypto-1_1.dll", "libssl-1_1.dll", "vcruntime140.dll"]
+    }
+  },
+  "config_files": [
+    {"path": "requirements.txt", "purpose": "Python 依赖"},
+    {"path": "VERSION", "purpose": "版本号（用于 GitHub 更新提示）"},
+    {"path": "static/update-notes.json", "purpose": "前端更新日志"},
+    {"path": "static/runninghub/api_providers.json", "purpose": "RunningHub API 列表"},
+    {"path": "tools/chrome-local-asset-importer/manifest.json", "purpose": "Chrome 扩展清单"},
+    {"path": "tools/photoshop-asset-connector/manifest.json", "purpose": "Photoshop 插件清单"}
+  ],
+  "workflows": [
+    {"file": "2511.json"},
+    {"file": "Flux2-Klein.json"},
+    {"file": "LTXDirectorv2-API.config.json"},
+    {"file": "LTXDirectorv2-API.json"},
+    {"file": "Z-Image-Enhance.json"},
+    {"file": "Z-Image.json"},
+    {"file": "upscale.json"}
+  ],
+  "tools": [
+    {
+      "name": "chrome-local-asset-importer",
+      "type": "browser-extension",
+      "path": "tools/chrome-local-asset-importer/",
+      "purpose": "Chrome 批量采集素材到画布本地素材库"
+    },
+    {
+      "name": "photoshop-asset-connector",
+      "type": "photoshop-plugin",
+      "path": "tools/photoshop-asset-connector/",
+      "purpose": "Photoshop 直连画布调用所有功能"
+    },
+    {
+      "name": "jimeng-cli",
+      "type": "powershell-script",
+      "path": "tools/jimeng_cli_install.ps1, jimeng_cli_login.ps1",
+      "purpose": "即梦 CLI 安装与登录"
+    }
+  ],
+  "documentation": [
+    {"path": "README.md", "topic": "项目介绍（双语）"},
+    {"path": "新手运行与使用教程.md", "topic": "新手完整教程", "size_kb": 25},
+    {"path": "MAC-使用说明.md", "topic": "macOS 使用"},
+    {"path": "运行说明.txt", "topic": "快速运行说明"},
+    {"path": "static/system-prompts/infinite-canvas-prompt-templates.md", "topic": "Prompt 模板"},
+    {"path": "static/vendor/MANIFEST.md", "topic": "前端依赖清单"}
+  ],
+  "features": [
+    {"id": 1, "name": "多协议 API", "details": "OpenAI / 异步 / Gemini / 方舟"},
+    {"id": 2, "name": "RunningHub", "details": "工作流 / AI 应用 / 收费模型"},
+    {"id": 3, "name": "火山引擎", "details": "含人脸认证（修复中）"},
+    {"id": 4, "name": "Modelscope", "details": "免费 LLM + 图像模型 + LoRA"},
+    {"id": 5, "name": "即梦 CLI", "details": "高级会员积分 / 文生图 / 图生图 / 文生视频 / 图生视频"},
+    {"id": 6, "name": "本地 ComfyUI", "details": "局域网接入 + 自定义工作流"},
+    {"id": 7, "name": "画布扩展功能", "details": "图片扩展 / 360 全景 / 视频帧抽取 / 循环节点"},
+    {"id": 8, "name": "浏览器/PS 插件", "details": "Chrome 批量采集 + Photoshop 直连"}
+  ],
+  "i18n": {
+    "languages_supported": 7,
+    "modules": ["common.js", "canvas.js", "studio.js", "smart-canvas.js", "api-settings.js", "comfyui-settings.js", "validate-i18n.js"]
+  },
+  "quickstart": {
+    "windows": [
+      "1. 双击 安装依赖.bat",
+      "2. 双击 run.bat",
+      "3. 浏览器自动打开 http://127.0.0.1:3000"
+    ],
+    "macos": [
+      "1. 运行 mac-安装依赖.sh（或双击 mac-安装依赖.command）",
+      "2. 双击 mac-启动服务.command"
+    ],
+    "three_modes": [
+      {"name": "API 模式", "setup": "注册 apimart.ai / apib.ai → 填 API Key + 协议"},
+      {"name": "Modelscope 模式", "setup": "免费 → 设置 Modelscope Key"},
+      {"name": "本地 ComfyUI 模式", "setup": "设置 ComfyUI 地址 + 导入工作流"}
+    ]
+  },
+  "external_links": {
+    "github": "https://github.com/hero8152/Infinite-Canvas",
+    "bilibili_author": "https://space.bilibili.com/78652351",
+    "video_tutorial": "https://youtu.be/1y9ShTvgC_w",
+    "api_recommend": "https://apib.ai/register?aff=1uyAbb"
+  },
+  "index_meta": {
+    "generated_at": "2026-06-25",
+    "tool": "sc:index-repo",
+    "next_session_savings_tokens": 55000,
+    "schema_version": "1.0"
+  }
+}
