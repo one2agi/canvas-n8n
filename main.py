@@ -2536,6 +2536,7 @@ class CanvasLLMRequest(BaseModel):
     ms_model: str = ""
     images: List[str] = []   # 可以是 /output/*.png、/assets/*.png 本地路径 或 http(s) URL 或 data URL
     videos: List[str] = []   # 可以是 /output/*.mp4、/assets/*.mp4 本地路径 或 http(s) URL 或 data URL
+    output_format: str = "text"  # "text" | "json"，启用 json 时 OpenAI 协议会传 response_format={type:json_object}
 
 class ConversationCreateRequest(BaseModel):
     title: str = "新对话"
@@ -12250,6 +12251,11 @@ async def canvas_llm(payload: CanvasLLMRequest):
     try:
         async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
             req_body = {"model": model, "messages": upstream_messages, "max_tokens": LLM_MAX_TOKENS}
+            if payload.output_format == "json":
+                # 启用 OpenAI JSON 模式（需要 provider 支持）
+                # _is_apimart 暂时不传，避免某些代理对 response_format 校验失败
+                if not _is_apimart:
+                    req_body["response_format"] = {"type": "json_object"}
             if _is_apimart:
                 req_body["stream"] = False   # APIMart 默认流式，强制关闭
             response = await client.post(
@@ -12276,8 +12282,19 @@ async def canvas_llm(payload: CanvasLLMRequest):
         text = text or "接口返回了空回复。"
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"解析回复内容失败：{exc}") from exc
+    # JSON 模式：必须返回合法 JSON，否则 422 错误
+    parsed_json = None
+    if payload.output_format == "json":
+        try:
+            parsed_json = json.loads(text)
+        except Exception as exc:
+            preview = text[:200].replace("\n", " ")
+            raise HTTPException(
+                status_code=422,
+                detail=f"LLM 未返回合法 JSON（{type(exc).__name__}: {exc}）。前 200 字符：{preview}"
+            ) from exc
     raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else {}
-    return {"text": text, "model": model, "raw_usage": raw_data.get("usage")}
+    return {"text": text, "json": parsed_json, "model": model, "raw_usage": raw_data.get("usage")}
 
 # --- 对话管理 ---
 

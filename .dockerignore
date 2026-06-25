@@ -1,0 +1,41 @@
+# Windows / Mac 专属（容器内用不到）
+python/
+packages/
+*.bat
+*.command
+MAC-*.md
+mac-*
+安装*.bat
+登录*.bat
+get-pip.py
+赞赏.png
+
+# 文档（不影响运行）
+README.md
+CLAUDE.md
+PROJECT_INDEX.*
+新手*.md
+MAC-使用说明.md
+运行说明.txt
+LICENSE
+
+# Git
+.git/
+.gitignore
+.dockerignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 数据（这些由 volume 挂载覆盖，不进镜像）
+assets/
+output/
+data/
+.history/
+
+# Docker 自身
+Dockerfile
+docker-compose.yml

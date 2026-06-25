@@ -5789,6 +5789,7 @@ function renderNode(node){
         body.innerHTML = `<div class="text-[11px] text-gray-400">${promptNodes.length} ${tr('canvas.promptCount')} ${tr('canvas.grouped')}</div>`;
     }
     if(node.type === 'llm') body.appendChild(renderLLMBody(node));
+    if(node.type === 'json-extractor') body.appendChild(renderJsonExtractorBody(node));
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
     if(node.type === 'video') body.appendChild(renderVideoBody(node));
@@ -10826,6 +10827,115 @@ async function runLLMNode(nodeId, opts={}){
         alert(err.message || 'LLM 运行失败');
     }
 }
+// JSON 提取节点：从源 LLM 节点的 outputText 解析 JSON，按 key 路径提取值
+function renderJsonExtractorBody(node){
+    const wrap = document.createElement('div');
+    wrap.className = 'llm-body';
+    // 源 LLM 节点下拉：列出所有 llm 类型节点
+    const llmNodes = nodes.filter(n => n.type === 'llm');
+    const sourceOptions = ['<option value="">-- 选择源 LLM 节点 --</option>']
+        .concat(llmNodes.map(n => `<option value="${escapeHtml(n.id)}" ${n.id === node.sourceNodeId ? 'selected' : ''}>${escapeHtml((n.title || n.id).slice(0, 40))}</option>`))
+        .join('');
+    wrap.innerHTML = `
+        <div class="llm-row">
+            <label style="font-size:11px;color:#6b7280;min-width:60px">源 LLM</label>
+            <select class="select-lite jsonex-source" style="flex:1">${sourceOptions}</select>
+        </div>
+        <div class="llm-row" style="margin-top:6px">
+            <label style="font-size:11px;color:#6b7280;min-width:60px">JSON key</label>
+            <input class="input-lite jsonex-key" type="text" placeholder="如: prompts.h01" value="${escapeHtml(node.jsonKey || '')}" style="flex:1"/>
+        </div>
+        <div class="llm-pane-label" style="margin-top:10px">提取结果</div>
+        <div class="llm-output-wrap" style="height:120px;flex:0 0 120px">
+            <button class="llm-copy-btn jsonex-output-copy" type="button" title="复制"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+            <div class="llm-output jsonex-result-output">${escapeHtml(node.outputText || '（运行后显示提取结果）')}</div>
+        </div>
+        <div class="gen-run-row mt-2">
+            <button class="llm-run jsonex-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? '运行中' : '运行 JSON 提取'}</button>
+            ${cascadeBtnHtml(node)}
+        </div>
+    `;
+    wrap.querySelector('.jsonex-source').onchange = e => {
+        node.sourceNodeId = e.target.value;
+        scheduleSave();
+    };
+    wrap.querySelector('.jsonex-key').oninput = e => {
+        node.jsonKey = e.target.value;
+        scheduleSave();
+    };
+    wrap.querySelector('.jsonex-run').onclick = async e => {
+        e.stopPropagation();
+        await runJsonExtractorNode(node.id);
+    };
+    bindCascadeButtons(wrap, node.id);
+    const copyBtn = wrap.querySelector('.jsonex-output-copy');
+    if(copyBtn){
+        copyBtn.onmousedown = e => e.stopPropagation();
+        copyBtn.onclick = async e => {
+            e.stopPropagation();
+            const text = node.outputText || '';
+            if(!text) return;
+            if(await copyTextToClipboard(text)){
+                copyBtn.classList.add('copied');
+                setTimeout(() => copyBtn.classList.remove('copied'), 1500);
+            }
+        };
+    }
+    if(window.lucide) lucide.createIcons();
+    return wrap;
+}
+async function runJsonExtractorNode(nodeId, opts={}){
+    const node = nodes.find(n => n.id === nodeId);
+    if(!node) return;
+    if(!node.sourceNodeId){
+        if(opts.cascade) throw new Error('JSON 提取节点未选择源 LLM');
+        alert('请先选择源 LLM 节点'); return;
+    }
+    const sourceNode = nodes.find(n => n.id === node.sourceNodeId);
+    if(!sourceNode || sourceNode.type !== 'llm'){
+        if(opts.cascade) throw new Error('源节点必须是 LLM 节点');
+        alert('源节点必须是 LLM 节点'); return;
+    }
+    if(!sourceNode.outputText){
+        if(opts.cascade) throw new Error('源 LLM 节点还没有输出，请先运行它');
+        alert('源 LLM 节点还没有输出，请先运行它'); return;
+    }
+    let json;
+    try {
+        json = JSON.parse(sourceNode.outputText);
+    } catch(e){
+        if(opts.cascade) throw new Error('源 LLM 输出不是合法 JSON: ' + e.message);
+        alert('源 LLM 输出不是合法 JSON: ' + e.message); return;
+    }
+    const path = (node.jsonKey || '').split('.').filter(Boolean);
+    if(path.length === 0){
+        if(opts.cascade) throw new Error('JSON key 不能为空');
+        alert('请填写 JSON key'); return;
+    }
+    let value = json;
+    for(const k of path){
+        if(value == null) break;
+        value = value[k];
+    }
+    if(value === undefined){
+        if(opts.cascade) throw new Error('JSON 中找不到 key "' + node.jsonKey + '"');
+        alert('JSON 中找不到 key "' + node.jsonKey + '"'); return;
+    }
+    if(!opts.cascade){ node.running = true; refreshNodes([node.id]); }
+    try {
+        node.outputText = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+        if(!opts.cascade) node.running = false;
+        node.runStatus = 'done'; node.runError = '';
+        refreshNodes([node.id]);
+        scheduleSave();
+    } catch(err){
+        if(!opts.cascade) node.running = false;
+        node.runStatus = 'failed'; node.runError = err.message || String(err);
+        refreshNodes([node.id]);
+        if(opts.cascade) throw err;
+        alert(err.message || 'JSON 提取失败');
+    }
+}
 // 判断是不是「链尾」节点：没有下游生成节点（直接相连或经 Output 中转都算）
 function isTerminalGenerator(nodeId){
     const GEN_TYPES = canvasRunTypes();
@@ -10911,6 +11021,7 @@ function runCascadeNodeByType(node, opts={}){
     if(node.type === 'comfy') return runComfyNode(node.id, runOpts);
     if(node.type === 'ltxDirector') return runLTXDirectorNode(node.id, runOpts);
     if(node.type === 'llm') return runLLMNode(node.id, runOpts);
+    if(node.type === 'json-extractor') return runJsonExtractorNode(node.id, runOpts);
     if(node.type === 'video') return runVideoNode(node.id, runOpts);
     if(node.type === 'rh') return runRhNode(node.id, runOpts);
     return Promise.resolve();
@@ -11189,6 +11300,7 @@ async function runOneCascadePass(order, options={}){
             else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'llm') await runLLMNode(id, {cascade:true, cascadeTargetId:targetId});
+            else if(node.type === 'json-extractor') await runJsonExtractorNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'video') await runVideoNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'rh') await runRhNode(id, {cascade:true, cascadeTargetId:targetId});
             if(targetId) ensureCascadeActive(targetId);
