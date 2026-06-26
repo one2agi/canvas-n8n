@@ -9746,7 +9746,7 @@ function generatorSources(gen){
             const conn = connections.find(c => c.to === gen.id && c.from === n.id);
             const portIndex = conn ? (conn.fromPort || 0) : 0;
             const item = n.sourceItems[portIndex] || n.sourceItems[0] || '';
-            return {id:`${n.id}:port:${portIndex}`, type:'jsonSplit', label:`json拆分[${portIndex}]`, refs:[], prompt:item};
+            return {id:`${n.id}:port:${portIndex}`, type:'jsonSplit', label:`[${portIndex}] ${(item || '').slice(0, 32)}${(item || '').length > 32 ? '…' : ''}`, refs:[], prompt:item};
         }
         return null;
     }).flat().filter(Boolean);
