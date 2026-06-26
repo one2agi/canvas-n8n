@@ -232,6 +232,11 @@ body.theme-dark .node-run-status.failed { background:rgba(239,68,68,.22); color:
 .node.sized.ltxDirector-node .gen-run-row,
 .node.sized.rh-node .gen-run-row,
 .node.sized.llm-node .gen-run-row { margin-top:auto; }
+.prompt-preview-title { margin-bottom:4px; font-size:10px; font-weight:800; color:#9ca3af; text-transform:uppercase; letter-spacing:.12em; }
+.prompt-preview-item { margin-bottom:6px; padding:8px 12px; border:1px solid #e8edf3; border-radius:10px; background:#f8fafc; color:#475569; font-size:11px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow:auto; user-select:text; cursor:text; }
+.prompt-preview-item:last-child { margin-bottom:0; }
+.prompt-preview-index { color:#64748b; font-weight:800; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+body.theme-dark .prompt-preview-item { background:rgba(15,23,42,.52); border-color:rgba(148,163,184,.22); color:#cbd5e1; }
 .gen-cascade-btn { height:40px; width:100%; flex:0 0 40px; border-radius:16px; background:transparent; border:1.5px solid var(--strong); color:var(--strong); display:flex; align-items:center; justify-content:center; gap:8px; font-size:11px; font-weight:800; letter-spacing:.12em; transition:all .15s ease; }
 .gen-cascade-btn:hover { background:var(--strong); color:var(--strong-text); }
 .gen-cascade-btn:disabled { opacity:.4; cursor:not-allowed; }
@@ -1250,27 +1255,38 @@ body.studio-theme-dark .comfy-random-btn.active,
 
 /* json 拆分节点 - 动态子输出框 */
 .jsplitter-body {
-    min-height: 180px;
-    max-height: 360px;
+    height: 100%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
 }
 .jsplitter-list {
     display: flex;
     flex-direction: column;
     gap: 6px;
     padding: 4px 0;
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
+    overscroll-behavior: contain;
+}
+.jsplitter-body .llm-pane-label,
+.jsplitter-body .gen-run-row {
+    flex: 0 0 auto;
+}
+.jsplitter-body .gen-run-row {
+    margin-top: 10px;
 }
 .jsplitter-item-box {
     display: flex;
-    align-items: center;
-    height: 36px;
+    align-items: flex-start;
+    height: auto;
+    min-height: 36px;
     border: 1px solid #e8edf3;
     border-radius: 6px;
     background: #fafbfc;
-    padding: 0 6px 0 10px;
+    padding: 8px 6px 8px 10px;
     transition: background .14s, border-color .14s;
     gap: 8px;
     position: relative;
@@ -1286,22 +1302,26 @@ body.studio-theme-dark .comfy-random-btn.active,
     font-weight: 600;
     font-family: monospace;
     text-align: center;
+    line-height: 18px;
 }
 .jsplitter-item-content {
     flex: 1;
     font-size: 11px;
     color: #475569;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: pre-wrap;
+    overflow: visible;
+    overflow-wrap: anywhere;
     font-family: monospace;
     min-width: 0;
+    line-height: 1.45;
+    user-select: text;
+    cursor: text;
 }
 /* box 内的输出端口（覆盖 .port.out 默认 44x44） */
 .jsplitter-item-box .port.out.multi {
     position: relative;
     right: auto;
-    top: auto;
+    top: -4px;
     transform: none;
     display: block;
     width: 28px;

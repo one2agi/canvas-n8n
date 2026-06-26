@@ -8277,7 +8277,11 @@ function renderVideoBody(node){
 }
 function renderPromptPreview(container, promptInputs){
     if(!container) return;
-    container.innerHTML = promptInputs.length ? `<div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Prompts</div>${promptInputs.map(src => `<div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2 line-clamp-2">${escapeHtml(src.label)}</div>`).join('')}` : '';
+    container.innerHTML = promptInputs.length ? `<div class="prompt-preview-title">Prompts</div>${promptInputs.map((src, i) => {
+        const text = String(src.prompt || src.label || '');
+        const prefix = promptInputs.length > 1 ? `<span class="prompt-preview-index">[${i}]</span> ` : '';
+        return `<div class="prompt-preview-item" title="${escapeAttr(text)}">${prefix}${escapeHtml(text)}</div>`;
+    }).join('')}` : '';
 }
 function renderImageInputList(list, node, imageInputs, emptyText=null){
     if(!list) return;
@@ -10908,12 +10912,11 @@ function renderJsonExtractorBody(node){
     const boxes = itemCount === 0
         ? `<div class="jsplitter-empty">（运行后自动拆分）</div>`
         : items.map((s, i) => {
-            const preview = (s || '').slice(0, 24);
-            const more = (s || '').length > 24 ? '…' : '';
+            const text = String(s || '');
             return `
             <div class="jsplitter-item-box" data-port="${i}">
                 <span class="jsplitter-item-num">${i}</span>
-                <div class="jsplitter-item-content" title="${escapeHtml(s || '')}">${escapeHtml(preview)}${more}</div>
+                <div class="jsplitter-item-content" title="${escapeAttr(text)}">${escapeHtml(text)}</div>
             </div>`;
         }).join('');
 
