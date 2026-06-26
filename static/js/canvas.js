@@ -2337,18 +2337,23 @@ function addLLMNode(point){
         running:false
     });
 }
-function addJsonExtractorNode(point){
+function addJsonSplitterNode(point){
     const p = point || defaultPoint(160, 0);
     return addNode({
         id:uid('jsonex'),
-        type:'json-extractor',
+        type:'json-splitter',
         x:p.x,
         y:p.y,
         inputs:[],
-        jsonKey:'',
-        outputText:'',
+        sourceText:'',         // 上游 LLM 的原始 outputText
+        sourceItems:[],        // 拆分后的字符串数组（自动 stringify）
+        outputPorts:0,         // 输出端口数（动态计算 = sourceItems.length）
         running:false
     });
+}
+// 兼容旧名（防止其他代码引用）
+function addJsonExtractorNode(point){
+    return addJsonSplitterNode(point);
 }
 function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
@@ -3248,7 +3253,7 @@ function convertOutputNodeToInputGroup(nodeId){
     nodes = nodes.filter(n => n.id !== nodeId);
     connections = connections.filter(c => c.from !== nodeId && c.to !== nodeId);
     downstream.forEach(toId => {
-        if(canConnect(group.id, toId) && !connections.some(c => c.from === group.id && c.to === toId)){
+        if(canConnect(group.id, toId) && !connections.some(c => c.from === group.id && c.to === toId && (c.fromPort || 0) === 0)){
             connections.push({id:uid('c'), from:group.id, to:toId});
         }
     });
@@ -3345,7 +3350,7 @@ function createLinkedNode(type){
     if(!created) return;
     const fromId = state.originKind === 'out' ? origin.id : created.id;
     const toId = state.originKind === 'out' ? created.id : origin.id;
-    if(canConnect(fromId, toId) && !connections.some(c => c.from === fromId && c.to === toId)){
+    if(canConnect(fromId, toId) && !connections.some(c => c.from === fromId && c.to === toId && (c.fromPort || 0) === 0)){
         connections.push({id:uid('c'), from:fromId, to:toId});
         syncLatestGeneratedOutputToConnection(fromId, toId);
         syncGeneratorInputs();
@@ -3912,7 +3917,7 @@ async function fillImageNode(nodeId, files, opts={}){
             connections = connections.filter(c => c.from !== source.id && c.to !== source.id);
             if(group){
                 outgoing.forEach(toId => {
-                    if(canConnect(group.id, toId) && !connections.some(c => c.from === group.id && c.to === toId)){
+                    if(canConnect(group.id, toId) && !connections.some(c => c.from === group.id && c.to === toId && (c.fromPort || 0) === 0)){
                         connections.push({id:uid('c'), from:group.id, to:toId});
                     }
                 });
@@ -5649,7 +5654,7 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : node.type === 'json-extractor' ? tr('canvas.jsonSplit') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : (node.type === 'json-extractor' || node.type === 'json-splitter') ? tr('canvas.jsonSplit') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const showStatus = ['generator','msgen','comfy','ltxDirector','llm','video','rh'].includes(node.type) && node.runStatus
@@ -5803,7 +5808,7 @@ function renderNode(node){
         body.innerHTML = `<div class="text-[11px] text-gray-400">${promptNodes.length} ${tr('canvas.promptCount')} ${tr('canvas.grouped')}</div>`;
     }
     if(node.type === 'llm') body.appendChild(renderLLMBody(node));
-    if(node.type === 'json-extractor') body.appendChild(renderJsonExtractorBody(node));
+    if(node.type === 'json-extractor' || node.type === 'json-splitter') body.appendChild(renderJsonExtractorBody(node));
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
     if(node.type === 'video') body.appendChild(renderVideoBody(node));
@@ -5829,10 +5834,20 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','json-extractor'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output','json-extractor'].includes(node.type);
+    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','json-extractor','json-splitter'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output','json-extractor','json-splitter'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
-    if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
+    if(canOutput){
+        // json-splitter 多输出：每个 sourceItem 一个端口
+        if(node.type === 'json-splitter' && (node.outputPorts || 0) > 0){
+            for(let i = 0; i < node.outputPorts; i++){
+                el.insertAdjacentHTML('beforeend',
+                    `<div class="port out multi" data-port="${i}" title="${tr('canvas.dragConnect')} [${i}]"></div>`);
+            }
+        } else {
+            el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
+        }
+    }
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
     el.querySelector('.node-head').onmousedown = e => {
         if(e.button !== 0) return;
@@ -5848,8 +5863,11 @@ function renderNode(node){
     };
     el.querySelector('.resize-handle').onmousedown = e => { if(e.button === 0 && !e.shiftKey) startNodeResize(e, node); };
     el.ondragstart = e => { e.preventDefault(); e.stopPropagation(); };
-    const out = el.querySelector('.port.out');
-    if(out) out.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'out'); };
+    // 多输出端口：每个 .port.out 单独绑定
+    el.querySelectorAll('.port.out').forEach((port, idx) => {
+        const portIndex = port.dataset.port !== undefined && port.dataset.port !== '' ? parseInt(port.dataset.port, 10) : idx;
+        port.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'out', portIndex); };
+    });
     const inp = el.querySelector('.port.in');
     if(inp) inp.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'in'); };
     return el;
@@ -7755,12 +7773,18 @@ function onLLMPaneResize(e){
     }
 }
 function llmInputText(node){
-    return connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
+    return connections.filter(c => c.to === node.id).map(c => {
+        const n = nodes.find(x => x.id === c.from);
+        if(!n) return '';
         if(n.type === 'prompt') return n.text || '';
         if(n.type === 'loop') return renderLoopPrompt(n);
         if(n.type === 'promptGroup') return (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => p.text || '').filter(Boolean).join('\n\n');
         if(n.type === 'llm') return n.outputText || '';
-        if(n.type === 'json-extractor') return n.outputText || '';
+        // json-splitter：按 fromPort 索引取对应元素
+        if(n.type === 'json-splitter' && Array.isArray(n.sourceItems) && n.sourceItems.length > 0){
+            const portIndex = c.fromPort || 0;
+            return n.sourceItems[portIndex] || n.sourceItems[0] || '';
+        }
         return '';
     }).filter(Boolean).join('\n\n');
 }
@@ -9710,7 +9734,13 @@ function generatorSources(gen){
             return {id:n.id, type:'promptGroup', label:`提示词 ${prompts.length} 个`, refs:[], prompt:prompts.join('\n\n')};
         }
         if(n.type === 'llm' && (n.mode || 'node') === 'node' && n.outputText) return {id:n.id, type:'llm', label:(n.outputText || 'LLM').slice(0, 32), refs:[], prompt:n.outputText || ''};
-        if(n.type === 'json-extractor' && n.outputText) return {id:n.id, type:'jsonExtract', label:`JSON: ${(n.jsonKey || '').slice(0, 24)}`, refs:[], prompt:n.outputText || ''};
+        if(n.type === 'json-splitter' && Array.isArray(n.sourceItems) && n.sourceItems.length > 0){
+            // 找从哪个端口连过来 → 取对应的 sourceItem
+            const conn = connections.find(c => c.to === gen.id && c.from === n.id);
+            const portIndex = conn ? (conn.fromPort || 0) : 0;
+            const item = n.sourceItems[portIndex] || n.sourceItems[0] || '';
+            return {id:`${n.id}:port:${portIndex}`, type:'jsonSplit', label:`json拆分[${portIndex}]`, refs:[], prompt:item};
+        }
         return null;
     }).flat().filter(Boolean);
 }
@@ -10863,25 +10893,21 @@ async function runLLMNode(nodeId, opts={}){
 function renderJsonExtractorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
+    const itemCount = (node.sourceItems || []).length;
+    const preview = itemCount === 0
+        ? '（运行后自动拆分）'
+        : `${itemCount} 个输出端口\n` + (node.sourceItems || []).map((s, i) => `[${i}] ${(s || '').slice(0, 30)}${(s || '').length > 30 ? '...' : ''}`).join('\n');
     wrap.innerHTML = `
-        <div class="llm-row" style="margin-top:6px">
-            <label style="font-size:11px;color:#6b7280;min-width:60px">JSON key</label>
-            <input class="input-lite jsonex-key" type="text" placeholder="如: prompts.h01" value="${escapeHtml(node.jsonKey || '')}" style="flex:1"/>
-        </div>
-        <div class="llm-pane-label" style="margin-top:10px">提取结果</div>
-        <div class="llm-output-wrap" style="height:120px;flex:0 0 120px">
-            <button class="llm-copy-btn jsonex-output-copy" type="button" title="复制"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
-            <div class="llm-output jsonex-result-output">${escapeHtml(node.outputText || '（运行后显示提取结果）')}</div>
+        <div class="llm-pane-label">拆分结果（${itemCount} 个端口）</div>
+        <div class="llm-output-wrap" style="height:140px;flex:0 0 140px">
+            <button class="llm-copy-btn jsonex-output-copy" type="button" title="复制所有"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+            <div class="llm-output jsonex-result-output" style="white-space:pre-wrap;font-family:monospace;font-size:11px">${escapeHtml(preview)}</div>
         </div>
         <div class="gen-run-row mt-2">
-            <button class="llm-run jsonex-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? '运行中' : '运行 JSON 提取'}</button>
+            <button class="llm-run jsonex-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? '运行中' : '运行 JSON 拆分'}</button>
             ${cascadeBtnHtml(node)}
         </div>
     `;
-    wrap.querySelector('.jsonex-key').oninput = e => {
-        node.jsonKey = e.target.value;
-        scheduleSave();
-    };
     wrap.querySelector('.jsonex-run').onclick = async e => {
         e.stopPropagation();
         await runJsonExtractorNode(node.id);
@@ -10892,7 +10918,7 @@ function renderJsonExtractorBody(node){
         copyBtn.onmousedown = e => e.stopPropagation();
         copyBtn.onclick = async e => {
             e.stopPropagation();
-            const text = node.outputText || '';
+            const text = (node.sourceItems || []).join('\n');
             if(!text) return;
             if(await copyTextToClipboard(text)){
                 copyBtn.classList.add('copied');
@@ -10903,50 +10929,66 @@ function renderJsonExtractorBody(node){
     if(window.lucide) lucide.createIcons();
     return wrap;
 }
-async function runJsonExtractorNode(nodeId, opts={}){
+// 把任意 JSON 值转成下游 prompt 可用的文本（宽容降级）
+function jsonValueToText(v){
+    if(v === null || v === undefined) return '';
+    if(typeof v === 'string') return v;
+    if(typeof v === 'object') return JSON.stringify(v, null, 2);
+    return String(v);  // number, boolean
+}
+
+// json 拆分：自动找上游 outputText 中的第一个数组/对象，按元素拆成多输出端口
+async function runJsonSplitterNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node) return;
-    // 通过连线（connections[]）读取源节点，与 generator/llm 一致
+
+    // 1. 通过连线找源
     const sourceConnections = connections.filter(c => c.to === nodeId);
     if(sourceConnections.length === 0){
         if(opts.cascade) throw new Error('JSON 拆分节点未连接源节点');
         alert('请先从上游节点拖线连接到本节点的输入端口'); return;
     }
     const sourceNode = nodes.find(n => n.id === sourceConnections[0].from);
-    if(!sourceNode || (sourceNode.type !== 'llm' && sourceNode.type !== 'json-extractor')){
-        if(opts.cascade) throw new Error('源节点必须是 LLM 或 json-extractor');
-        alert('源节点必须是 LLM 或 json-extractor 节点'); return;
+    if(!sourceNode){
+        if(opts.cascade) throw new Error('源节点不存在');
+        alert('源节点不存在'); return;
     }
     if(!sourceNode.outputText){
-        if(opts.cascade) throw new Error('源 LLM 节点还没有输出，请先运行它');
-        alert('源 LLM 节点还没有输出，请先运行它'); return;
+        if(opts.cascade) throw new Error('源节点还没有输出');
+        alert('源节点还没有输出，请先运行它'); return;
     }
-    let json;
-    try {
-        json = JSON.parse(sourceNode.outputText);
-    } catch(e){
-        if(opts.cascade) throw new Error('源 LLM 输出不是合法 JSON: ' + e.message);
-        alert('源 LLM 输出不是合法 JSON: ' + e.message); return;
-    }
-    const path = (node.jsonKey || '').split('.').filter(Boolean);
-    if(path.length === 0){
-        if(opts.cascade) throw new Error('JSON key 不能为空');
-        alert('请填写 JSON key'); return;
-    }
-    let value = json;
-    for(const k of path){
-        if(value == null) break;
-        value = value[k];
-    }
-    if(value === undefined){
-        if(opts.cascade) throw new Error('JSON 中找不到 key "' + node.jsonKey + '"');
-        alert('JSON 中找不到 key "' + node.jsonKey + '"'); return;
-    }
+
     if(!opts.cascade){ node.running = true; refreshNodes([node.id]); }
     try {
-        node.outputText = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-        if(!opts.cascade) node.running = false;
+        node.sourceText = sourceNode.outputText;
+
+        // 2. 解析 + 自动找第一个数组/对象
+        let parsed;
+        try { parsed = JSON.parse(sourceNode.outputText); }
+        catch(e){
+            // 不是 JSON：整个 outputText 作为 1 个元素
+            parsed = sourceNode.outputText;
+        }
+
+        let items = [];
+        if(Array.isArray(parsed)){
+            items = parsed;
+        } else if(parsed && typeof parsed === 'object'){
+            // 找第一个数组字段；否则整个对象作为 1 个元素
+            const firstArrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
+            items = firstArrayKey ? parsed[firstArrayKey] : [parsed];
+        } else {
+            // 字符串/数字/布尔：1 个元素
+            items = [parsed];
+        }
+
+        // 3. 自动 stringify + 设置 sourceItems
+        node.sourceItems = items.map(jsonValueToText);
+        node.outputPorts = node.sourceItems.length;
         node.runStatus = 'done'; node.runError = '';
+
+        if(!opts.cascade) node.running = false;
+        // 触发重渲染（端口数变化 → renderNode 重新插入端口）
         refreshNodes([node.id]);
         scheduleSave();
     } catch(err){
@@ -10954,8 +10996,13 @@ async function runJsonExtractorNode(nodeId, opts={}){
         node.runStatus = 'failed'; node.runError = err.message || String(err);
         refreshNodes([node.id]);
         if(opts.cascade) throw err;
-        alert(err.message || 'JSON 提取失败');
+        alert(err.message || 'JSON 拆分失败');
     }
+}
+
+// 兼容旧名
+async function runJsonExtractorNode(nodeId, opts={}){
+    return runJsonSplitterNode(nodeId, opts);
 }
 // 判断是不是「链尾」节点：没有下游生成节点（直接相连或经 Output 中转都算）
 function isTerminalGenerator(nodeId){
@@ -11042,7 +11089,7 @@ function runCascadeNodeByType(node, opts={}){
     if(node.type === 'comfy') return runComfyNode(node.id, runOpts);
     if(node.type === 'ltxDirector') return runLTXDirectorNode(node.id, runOpts);
     if(node.type === 'llm') return runLLMNode(node.id, runOpts);
-    if(node.type === 'json-extractor') return runJsonExtractorNode(node.id, runOpts);
+    if(node.type === 'json-extractor' || node.type === 'json-splitter') return runJsonExtractorNode(node.id, runOpts);
     if(node.type === 'video') return runVideoNode(node.id, runOpts);
     if(node.type === 'rh') return runRhNode(node.id, runOpts);
     return Promise.resolve();
@@ -11321,7 +11368,7 @@ async function runOneCascadePass(order, options={}){
             else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'llm') await runLLMNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'json-extractor') await runJsonExtractorNode(id, {cascade:true, cascadeTargetId:targetId});
+            else if(node.type === 'json-extractor' || node.type === 'json-splitter') await runJsonExtractorNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'video') await runVideoNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'rh') await runRhNode(id, {cascade:true, cascadeTargetId:targetId});
             if(targetId) ensureCascadeActive(targetId);
@@ -13320,12 +13367,13 @@ function onNodeResize(e){
     renderSelectionHub();
     scheduleMinimapRender();
 }
-function startLink(e, originId, originKind){
+function startLink(e, originId, originKind, fromPort){
     e.stopPropagation();
     originKind = originKind || 'out';
-    const src = portPoint(originId, originKind);
+    fromPort = fromPort || null;
+    const src = portPoint(originId, originKind, fromPort);
     const source = nodes.find(n => n.id === originId);
-    tempLink = {from:originId, originKind, x1:src.x, y1:src.y, x2:src.x, y2:src.y};
+    tempLink = {from:originId, fromPort, originKind, x1:src.x, y1:src.y, x2:src.x, y2:src.y};
     window.onmousemove = e2 => {
         const p = screenToWorld(e2.clientX, e2.clientY);
         tempLink.x2 = p.x;
@@ -13341,9 +13389,10 @@ function startLink(e, originId, originKind){
             const fromId = originKind === 'out' ? originId : targetId;
             const toId = originKind === 'out' ? targetId : originId;
             if(canConnect(fromId, toId)){
-                if(!connections.some(c => c.from === fromId && c.to === toId)){
+                // 多输出端口：fromPort 区分同一 (from, to) 的不同连接
+                if(!connections.some(c => c.from === fromId && c.to === toId && (c.fromPort || 0) === (fromPort || 0))){
                     pushUndo();
-                    connections.push({id:uid('c'), from:fromId, to:toId});
+                    connections.push({id:uid('c'), from:fromId, fromPort, to:toId});
                     syncLatestGeneratedOutputToConnection(fromId, toId);
                 }
                 syncGeneratorInputs();
@@ -13427,11 +13476,11 @@ function canConnect(fromId, toId){
         const allowPrompt = Boolean(to.showPrompt) && ['prompt','promptGroup','loop','llm'].includes(from.type);
         return allowImage || allowPrompt;
     }
-    if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output','json-extractor'].includes(from.type);
-    if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type) || to.type === 'json-extractor';
-    if(from.type === 'json-extractor') return CANVAS_GENERATOR_TYPES.includes(to.type) || to.type === 'llm' || to.type === 'json-extractor';
-    if(to.type === 'json-extractor') return ['llm','json-extractor','output'].includes(from.type);
-    return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm','json-extractor'].includes(from.type);
+    if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output','json-extractor','json-splitter'].includes(from.type);
+    if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type) || to.type === 'json-extractor' || to.type === 'json-splitter';
+    if(from.type === 'json-extractor' || from.type === 'json-splitter') return CANVAS_GENERATOR_TYPES.includes(to.type) || to.type === 'llm' || to.type === 'json-extractor' || to.type === 'json-splitter';
+    if(to.type === 'json-extractor' || to.type === 'json-splitter') return ['llm','json-extractor','json-splitter','output'].includes(from.type);
+    return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm','json-extractor','json-splitter'].includes(from.type);
 }
 function sanitizeConnections(){
     connections = (connections || []).filter(c => canConnect(c.from, c.to));
@@ -13548,11 +13597,18 @@ function updateGroupMembership(movedNodes){
     }
 }
 
-function portPoint(id, kind){
+function portPoint(id, kind, portIndex){
     const n = nodes.find(x => x.id === id);
     if(!n) return {x:0,y:0};  // 真正的孤儿连线（节点已删除）：renderLinks 会跳过它
     const el = nodesEl.querySelector(`.node[data-id="${CSS.escape(id)}"]`);
-    const port = el?.querySelector(`.port.${kind}`);
+    // 多输出端口：按 portIndex 精确查找
+    let port = null;
+    if(portIndex !== null && portIndex !== undefined && el){
+        port = el.querySelector(`.port.${kind}[data-port="${portIndex}"]`);
+    }
+    if(!port){
+        port = el?.querySelector(`.port.${kind}`);
+    }
     if(port){
         const r = port.getBoundingClientRect();
         return screenToWorld(r.left + r.width / 2, r.top + r.height / 2);
@@ -13578,7 +13634,8 @@ function renderLinks(){
         // 端点无法解析（节点已删除、或尚未渲染出 DOM）就跳过，否则连线会被画到 (0,0)，
         // 看起来像很多连线都从同一个空白处中转。
         if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
-        segments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
+        // 多输出：connection.fromPort 决定从哪个端口出发
+        segments.push({c, a:portPoint(c.from, 'out', c.fromPort), b:portPoint(c.to, 'in')});
     });
     segments.forEach(({c, a, b}) => {
         linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, 'link'));
