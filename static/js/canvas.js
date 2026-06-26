@@ -2344,7 +2344,6 @@ function addJsonSplitterNode(point){
         type:'json-splitter',
         x:p.x,
         y:p.y,
-        inputs:[],
         sourceText:'',         // 上游 LLM 的原始 outputText
         sourceItems:[],        // 拆分后的字符串数组（自动 stringify）
         outputPorts:0,         // 输出端口数（动态计算 = sourceItems.length）
