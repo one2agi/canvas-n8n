@@ -2344,7 +2344,7 @@ function addJsonExtractorNode(point){
         type:'json-extractor',
         x:p.x,
         y:p.y,
-        sourceNodeId:'',
+        inputs:[],
         jsonKey:'',
         outputText:'',
         running:false
@@ -5649,7 +5649,7 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : node.type === 'json-extractor' ? tr('canvas.jsonSplit') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const showStatus = ['generator','msgen','comfy','ltxDirector','llm','video','rh'].includes(node.type) && node.runStatus
@@ -5829,8 +5829,8 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
+    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','json-extractor'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output','json-extractor'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
@@ -10859,21 +10859,11 @@ async function runLLMNode(nodeId, opts={}){
         alert(err.message || 'LLM 运行失败');
     }
 }
-// JSON 提取节点：从源 LLM 节点的 outputText 解析 JSON，按 key 路径提取值
+// JSON 提取节点：源通过连线（inputs[]）提供，从源节点的 outputText 解析 JSON，按 key 路径提取值
 function renderJsonExtractorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
-    // 源 LLM 节点下拉：列出所有 llm 类型节点
-    // 源节点可以是 LLM（输出 JSON）或 json-extractor（链式提取）
-    const llmNodes = nodes.filter(n => n.type === 'llm' || (n.type === 'json-extractor' && n.outputText));
-    const sourceOptions = ['<option value="">-- 选择源 LLM 节点 --</option>']
-        .concat(llmNodes.map(n => `<option value="${escapeHtml(n.id)}" ${n.id === node.sourceNodeId ? 'selected' : ''}>${escapeHtml((n.title || n.id).slice(0, 40))}</option>`))
-        .join('');
     wrap.innerHTML = `
-        <div class="llm-row">
-            <label style="font-size:11px;color:#6b7280;min-width:60px">源 LLM</label>
-            <select class="select-lite jsonex-source" style="flex:1">${sourceOptions}</select>
-        </div>
         <div class="llm-row" style="margin-top:6px">
             <label style="font-size:11px;color:#6b7280;min-width:60px">JSON key</label>
             <input class="input-lite jsonex-key" type="text" placeholder="如: prompts.h01" value="${escapeHtml(node.jsonKey || '')}" style="flex:1"/>
@@ -10888,10 +10878,6 @@ function renderJsonExtractorBody(node){
             ${cascadeBtnHtml(node)}
         </div>
     `;
-    wrap.querySelector('.jsonex-source').onchange = e => {
-        node.sourceNodeId = e.target.value;
-        scheduleSave();
-    };
     wrap.querySelector('.jsonex-key').oninput = e => {
         node.jsonKey = e.target.value;
         scheduleSave();
@@ -10920,11 +10906,13 @@ function renderJsonExtractorBody(node){
 async function runJsonExtractorNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node) return;
-    if(!node.sourceNodeId){
-        if(opts.cascade) throw new Error('JSON 提取节点未选择源 LLM');
-        alert('请先选择源 LLM 节点'); return;
+    // 通过连线（connections[]）读取源节点，与 generator/llm 一致
+    const sourceConnections = connections.filter(c => c.to === nodeId);
+    if(sourceConnections.length === 0){
+        if(opts.cascade) throw new Error('JSON 拆分节点未连接源节点');
+        alert('请先从上游节点拖线连接到本节点的输入端口'); return;
     }
-    const sourceNode = nodes.find(n => n.id === node.sourceNodeId);
+    const sourceNode = nodes.find(n => n.id === sourceConnections[0].from);
     if(!sourceNode || (sourceNode.type !== 'llm' && sourceNode.type !== 'json-extractor')){
         if(opts.cascade) throw new Error('源节点必须是 LLM 或 json-extractor');
         alert('源节点必须是 LLM 或 json-extractor 节点'); return;
