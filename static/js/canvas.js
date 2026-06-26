@@ -5838,12 +5838,19 @@ function renderNode(node){
     const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output','json-extractor','json-splitter'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput){
-        // json-splitter 多输出：每个 sourceItem 一个端口
+        // json-splitter 多输出：每个 sourceItem 一个端口，插入到对应 box 内部
         if(node.type === 'json-splitter' && (node.outputPorts || 0) > 0){
             for(let i = 0; i < node.outputPorts; i++){
-                el.insertAdjacentHTML('beforeend',
-                    `<div class="port out multi" data-port="${i}" title="${tr('canvas.dragConnect')} [${i}]"></div>`);
+                // 找对应的 box，把端口插入到 box 内部右侧
+                const box = el.querySelector(`.jsplitter-item-box[data-port="${i}"]`);
+                if(box){
+                    box.insertAdjacentHTML('beforeend',
+                        `<div class="port out multi" data-port="${i}" title="${tr('canvas.dragConnect')} [${i}]"></div>`);
+                }
+                // fallback：如果 box 还没渲染（N=0 时），端口不显示
             }
+        } else if(node.type === 'json-splitter'){
+            // json-splitter 但 N=0：暂时不显示端口（运行后才有）
         } else {
             el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
         }
@@ -10892,19 +10899,29 @@ async function runLLMNode(nodeId, opts={}){
 // JSON 提取节点：源通过连线（inputs[]）提供，从源节点的 outputText 解析 JSON，按 key 路径提取值
 function renderJsonExtractorBody(node){
     const wrap = document.createElement('div');
-    wrap.className = 'llm-body';
-    const itemCount = (node.sourceItems || []).length;
-    const preview = itemCount === 0
-        ? '（运行后自动拆分）'
-        : `${itemCount} 个输出端口\n` + (node.sourceItems || []).map((s, i) => `[${i}] ${(s || '').slice(0, 30)}${(s || '').length > 30 ? '...' : ''}`).join('\n');
+    wrap.className = 'llm-body jsplitter-body';
+    const items = node.sourceItems || [];
+    const itemCount = items.length;
+
+    // 动态生成 N 个矩形框（N = sourceItems.length）
+    // 每个 box 右侧的真实输出端口由 renderNode 步骤 2 插入
+    const boxes = itemCount === 0
+        ? `<div class="jsplitter-empty">（运行后自动拆分）</div>`
+        : items.map((s, i) => {
+            const preview = (s || '').slice(0, 24);
+            const more = (s || '').length > 24 ? '…' : '';
+            return `
+            <div class="jsplitter-item-box" data-port="${i}">
+                <span class="jsplitter-item-num">${i}</span>
+                <div class="jsplitter-item-content" title="${escapeHtml(s || '')}">${escapeHtml(preview)}${more}</div>
+            </div>`;
+        }).join('');
+
     wrap.innerHTML = `
         <div class="llm-pane-label">拆分结果（${itemCount} 个端口）</div>
-        <div class="llm-output-wrap" style="height:140px;flex:0 0 140px">
-            <button class="llm-copy-btn jsonex-output-copy" type="button" title="复制所有"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
-            <div class="llm-output jsonex-result-output" style="white-space:pre-wrap;font-family:monospace;font-size:11px">${escapeHtml(preview)}</div>
-        </div>
+        <div class="jsplitter-list">${boxes}</div>
         <div class="gen-run-row mt-2">
-            <button class="llm-run jsonex-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? '运行中' : '运行 JSON 拆分'}</button>
+            <button class="llm-run jsonex-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? '运行中' : '运行 json 拆分'}</button>
             ${cascadeBtnHtml(node)}
         </div>
     `;
@@ -10913,19 +10930,6 @@ function renderJsonExtractorBody(node){
         await runJsonExtractorNode(node.id);
     };
     bindCascadeButtons(wrap, node.id);
-    const copyBtn = wrap.querySelector('.jsonex-output-copy');
-    if(copyBtn){
-        copyBtn.onmousedown = e => e.stopPropagation();
-        copyBtn.onclick = async e => {
-            e.stopPropagation();
-            const text = (node.sourceItems || []).join('\n');
-            if(!text) return;
-            if(await copyTextToClipboard(text)){
-                copyBtn.classList.add('copied');
-                setTimeout(() => copyBtn.classList.remove('copied'), 1500);
-            }
-        };
-    }
     if(window.lucide) lucide.createIcons();
     return wrap;
 }
@@ -13604,7 +13608,12 @@ function portPoint(id, kind, portIndex){
     // 多输出端口：按 portIndex 精确查找
     let port = null;
     if(portIndex !== null && portIndex !== undefined && el){
+        // 优先查 json-splitter box 内的端口（class 是 .port.out.multi）
         port = el.querySelector(`.port.${kind}[data-port="${portIndex}"]`);
+        // 兼容：旧版 box 可能没有 .jsplitter-item-box 包裹
+        if(!port){
+            port = el.querySelector(`.jsplitter-item-box .port[data-port="${portIndex}"]`);
+        }
     }
     if(!port){
         port = el?.querySelector(`.port.${kind}`);

@@ -624,7 +624,8 @@ input[type=range].canvas-range::-webkit-slider-runnable-track { height:3px; bord
 .port:hover::after { transform:scale(1.25); }
 .port.in { left:-29px; cursor:crosshair; }
 .port.out { right:-15px; }
-.port.out.multi { position:relative; right:auto; top:auto; transform:none; display:block; margin:4px 0; }
+.port.out.multi { position:relative; right:auto; top:auto; transform:none; display:block; width:28px; height:28px; margin:0; flex-shrink:0; }
+.port.out.multi::after { left:8px; top:8px; width:12px; height:12px; }
 .node > .port { top:50%; }
 .ltxDirector-node > .port,
 .ltx-director-node > .port { top:50%; }
@@ -1245,4 +1246,81 @@ body.studio-theme-dark .comfy-random-btn.active,
     .asset-manager-body { grid-template-columns:1fr; overflow:auto; }
     .asset-manager-side,.asset-manager-main { overflow:visible; }
     .canvas-asset-panel { right:14px; top:66px; bottom:90px; }
+}
+
+/* json 拆分节点 - 动态子输出框 */
+.jsplitter-body {
+    min-height: 180px;
+    max-height: 360px;
+    display: flex;
+    flex-direction: column;
+}
+.jsplitter-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 0;
+    flex: 1;
+    overflow-y: auto;
+}
+.jsplitter-item-box {
+    display: flex;
+    align-items: center;
+    height: 36px;
+    border: 1px solid #e8edf3;
+    border-radius: 6px;
+    background: #fafbfc;
+    padding: 0 6px 0 10px;
+    transition: background .14s, border-color .14s;
+    gap: 8px;
+    position: relative;
+}
+.jsplitter-item-box:hover {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+}
+.jsplitter-item-num {
+    flex: 0 0 18px;
+    font-size: 10px;
+    color: #94a3b8;
+    font-weight: 600;
+    font-family: monospace;
+    text-align: center;
+}
+.jsplitter-item-content {
+    flex: 1;
+    font-size: 11px;
+    color: #475569;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: monospace;
+    min-width: 0;
+}
+/* box 内的输出端口（覆盖 .port.out 默认 44x44） */
+.jsplitter-item-box .port.out.multi {
+    position: relative;
+    right: auto;
+    top: auto;
+    transform: none;
+    display: block;
+    width: 28px;
+    height: 28px;
+    margin: 0;
+    flex-shrink: 0;
+}
+.jsplitter-item-box .port.out.multi::after {
+    left: 8px;
+    top: 8px;
+    width: 12px;
+    height: 12px;
+}
+.jsplitter-empty {
+    color: #9ca3af;
+    text-align: center;
+    padding: 30px 0;
+    font-size: 12px;
+    background: #f8fafc;
+    border-radius: 6px;
+    border: 1px dashed #e2e8f0;
 }
