@@ -2336,6 +2336,19 @@ function addLLMNode(point){
         running:false
     });
 }
+function addJsonExtractorNode(point){
+    const p = point || defaultPoint(160, 0);
+    return addNode({
+        id:uid('jsonex'),
+        type:'json-extractor',
+        x:p.x,
+        y:p.y,
+        sourceNodeId:'',
+        jsonKey:'',
+        outputText:'',
+        running:false
+    });
+}
 function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
     const providerId = imageApiProviders()[0]?.id || '';
