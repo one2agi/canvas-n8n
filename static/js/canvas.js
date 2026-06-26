@@ -2327,6 +2327,7 @@ function addLLMNode(point){
         llmProvider:providerId,
         model:resolveChatModel('', providerId),
         mode:'node',
+        outputFormat:'text',  // 新增：'text' | 'json'，控制 OpenAI response_format
         systemPrompt:'You are a helpful assistant. Rewrite the input into a concise image prompt.',
         chatInput:'',
         messages:[],
@@ -7506,12 +7507,19 @@ function renderLLMBody(node){
     ].filter(Boolean).join(' · ');
     const imgBadge = mediaBadgeText ? `<div style="display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:8px;background:rgba(16,185,129,.12);color:#047857;font-size:10.5px;font-weight:700;width:fit-content;line-height:1.4"><i data-lucide="${videos.length && !imgs.length ? 'video' : 'image'}" class="w-3 h-3"></i>已连接 ${mediaBadgeText} · 需选支持视觉/视频的模型</div>` : '';
     node.showSystem = Boolean(node.showSystem);
+    node.outputFormat = node.outputFormat || 'text';
     wrap.innerHTML = `
         <div class="llm-row">
             <select class="select-lite llm-provider-select" style="flex:1">${chatProviderOptions(llmProv)}</select>
             <select class="select-lite llm-model">${modelOpts}</select>
             <div class="llm-mode"><button data-mode="node">${tr('canvas.nodeMode')}</button><button data-mode="chat">${tr('canvas.chatMode')}</button></div>
             <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button">System</button>
+        </div>
+        <div class="llm-row" style="margin-top:4px">
+            <label style="font-size:10.5px;color:#6b7280">输出格式</label>
+            <button class="llm-fmt-toggle ${node.outputFormat === 'text' ? 'active' : ''}" data-fmt="text" type="button" style="flex:0 0 auto">文本</button>
+            <button class="llm-fmt-toggle ${node.outputFormat === 'json' ? 'active' : ''}" data-fmt="json" type="button" style="flex:0 0 auto;background:${node.outputFormat === 'json' ? 'rgba(16,185,129,.18)' : 'transparent'};color:${node.outputFormat === 'json' ? '#047857' : '#6b7280'}">JSON</button>
+            <span style="font-size:10px;color:#9ca3af;flex:1">${node.outputFormat === 'json' ? '✦ response_format: json_object' : ''}</span>
         </div>
         ${imgBadge}
         ${node.showSystem ? `<textarea class="llm-system" placeholder="${tr('canvas.systemPrompt')}">${escapeHtml(node.systemPrompt || '')}</textarea>` : ''}
@@ -7542,6 +7550,14 @@ function renderLLMBody(node){
         scheduleSave();
     };
     wrap.querySelector('.llm-sys-toggle').onclick = e => { e.stopPropagation(); node.showSystem = !node.showSystem; render(); scheduleSave(); };
+    wrap.querySelectorAll('.llm-fmt-toggle').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            node.outputFormat = btn.dataset.fmt;
+            scheduleSave();
+            render();
+        };
+    });
     const sysEl = wrap.querySelector('.llm-system');
     if(sysEl){ sysEl.oninput = e => { node.systemPrompt = e.target.value; scheduleSave(); }; bindScrollableText(sysEl); }
     wrap.querySelectorAll('[data-mode]').forEach(btn => {
@@ -7744,6 +7760,7 @@ function llmInputText(node){
         if(n.type === 'loop') return renderLoopPrompt(n);
         if(n.type === 'promptGroup') return (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => p.text || '').filter(Boolean).join('\n\n');
         if(n.type === 'llm') return n.outputText || '';
+        if(n.type === 'json-extractor') return n.outputText || '';
         return '';
     }).filter(Boolean).join('\n\n');
 }
@@ -9693,6 +9710,7 @@ function generatorSources(gen){
             return {id:n.id, type:'promptGroup', label:`提示词 ${prompts.length} 个`, refs:[], prompt:prompts.join('\n\n')};
         }
         if(n.type === 'llm' && (n.mode || 'node') === 'node' && n.outputText) return {id:n.id, type:'llm', label:(n.outputText || 'LLM').slice(0, 32), refs:[], prompt:n.outputText || ''};
+        if(n.type === 'json-extractor' && n.outputText) return {id:n.id, type:'jsonExtract', label:`JSON: ${(n.jsonKey || '').slice(0, 24)}`, refs:[], prompt:n.outputText || ''};
         return null;
     }).flat().filter(Boolean);
 }
@@ -10802,6 +10820,7 @@ async function callCanvasLLM(node, message, messages=[], options={}){
             messages,
             images,
             videos,
+            output_format: node.outputFormat || 'text',
         })
     }, options).then(async r => {
         if(!r.ok){
@@ -10845,7 +10864,8 @@ function renderJsonExtractorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
     // 源 LLM 节点下拉：列出所有 llm 类型节点
-    const llmNodes = nodes.filter(n => n.type === 'llm');
+    // 源节点可以是 LLM（输出 JSON）或 json-extractor（链式提取）
+    const llmNodes = nodes.filter(n => n.type === 'llm' || (n.type === 'json-extractor' && n.outputText));
     const sourceOptions = ['<option value="">-- 选择源 LLM 节点 --</option>']
         .concat(llmNodes.map(n => `<option value="${escapeHtml(n.id)}" ${n.id === node.sourceNodeId ? 'selected' : ''}>${escapeHtml((n.title || n.id).slice(0, 40))}</option>`))
         .join('');
@@ -10905,9 +10925,9 @@ async function runJsonExtractorNode(nodeId, opts={}){
         alert('请先选择源 LLM 节点'); return;
     }
     const sourceNode = nodes.find(n => n.id === node.sourceNodeId);
-    if(!sourceNode || sourceNode.type !== 'llm'){
-        if(opts.cascade) throw new Error('源节点必须是 LLM 节点');
-        alert('源节点必须是 LLM 节点'); return;
+    if(!sourceNode || (sourceNode.type !== 'llm' && sourceNode.type !== 'json-extractor')){
+        if(opts.cascade) throw new Error('源节点必须是 LLM 或 json-extractor');
+        alert('源节点必须是 LLM 或 json-extractor 节点'); return;
     }
     if(!sourceNode.outputText){
         if(opts.cascade) throw new Error('源 LLM 节点还没有输出，请先运行它');
@@ -13419,9 +13439,11 @@ function canConnect(fromId, toId){
         const allowPrompt = Boolean(to.showPrompt) && ['prompt','promptGroup','loop','llm'].includes(from.type);
         return allowImage || allowPrompt;
     }
-    if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output'].includes(from.type);
-    if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type);
-    return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm'].includes(from.type);
+    if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output','json-extractor'].includes(from.type);
+    if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type) || to.type === 'json-extractor';
+    if(from.type === 'json-extractor') return CANVAS_GENERATOR_TYPES.includes(to.type) || to.type === 'llm' || to.type === 'json-extractor';
+    if(to.type === 'json-extractor') return ['llm','json-extractor','output'].includes(from.type);
+    return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm','json-extractor'].includes(from.type);
 }
 function sanitizeConnections(){
     connections = (connections || []).filter(c => canConnect(c.from, c.to));
