@@ -7606,14 +7606,13 @@ function renderLLMNodePane(container, node){
     const isReadonly = connectedInput.length > 0;
     const inputValue = connectedInput || node.userInput || '';
     const inputHeight = Math.max(70, node.llmInputHeight || 110);
-    const outputHeight = Math.max(70, node.llmOutputHeight || 150);
     const inputPlaceholder = langIsEn() ? 'Type input, or connect a Prompt node…' : '直接输入，或连接提示词节点…';
     container.innerHTML = `
         <div class="llm-pane-label">Input${isReadonly ? ' <span style="font-size:9px;opacity:.5;font-weight:600;text-transform:none;letter-spacing:0">(来自连接)</span>' : ''}</div>
         <textarea class="llm-input-area llm-input-output" style="height:${inputHeight}px; flex:0 0 ${inputHeight}px;" ${isReadonly ? 'readonly' : ''} placeholder="${inputPlaceholder}">${escapeHtml(inputValue)}</textarea>
         <div class="llm-pane-resizer" title="${tr('canvas.resizePanes')}"></div>
         <div class="llm-pane-label">Output</div>
-        <div class="llm-output-wrap" style="height:${outputHeight}px; flex:0 0 ${outputHeight}px;">
+        <div class="llm-output-wrap">
             <button class="llm-copy-btn llm-output-copy" type="button" title="复制"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
             <div class="llm-output llm-result-output">${escapeHtml(node.outputText || tr('canvas.llmOutputEmpty'))}</div>
         </div>
@@ -7751,32 +7750,23 @@ function startLLMPaneResize(e, node){
     llmPaneDrag = {
         node,
         sy:e.clientY,
-        inputStart:Math.max(70, node.llmInputHeight || 110),
-        outputStart:Math.max(70, node.llmOutputHeight || 150)
+        inputStart:Math.max(70, node.llmInputHeight || 110)
     };
     window.onmousemove = onLLMPaneResize;
     window.onmouseup = endDrag;
 }
 function onLLMPaneResize(e){
     if(!llmPaneDrag) return;
-    const total = llmPaneDrag.inputStart + llmPaneDrag.outputStart;
     const delta = (e.clientY - llmPaneDrag.sy) / viewport.scale;
     const minPane = 70;
-    const nextInput = Math.max(minPane, Math.min(total - minPane, llmPaneDrag.inputStart + delta));
-    const nextOutput = Math.max(minPane, total - nextInput);
+    const nextInput = Math.max(minPane, llmPaneDrag.inputStart + delta);
     llmPaneDrag.node.llmInputHeight = Math.round(nextInput);
-    llmPaneDrag.node.llmOutputHeight = Math.round(nextOutput);
     const el = nodesEl.querySelector(`.node[data-id="${llmPaneDrag.node.id}"]`);
     if(el){
         const inputEl = el.querySelector('.llm-input-output');
-        const outputEl = el.querySelector('.llm-result-output');
         if(inputEl){
             inputEl.style.height = `${llmPaneDrag.node.llmInputHeight}px`;
             inputEl.style.flexBasis = `${llmPaneDrag.node.llmInputHeight}px`;
-        }
-        if(outputEl){
-            outputEl.style.height = `${llmPaneDrag.node.llmOutputHeight}px`;
-            outputEl.style.flexBasis = `${llmPaneDrag.node.llmOutputHeight}px`;
         }
     }
 }
@@ -9794,7 +9784,10 @@ function parseJsonSplitterItems(sourceText){
     try { parsed = JSON.parse(sourceText); }
     catch(_) { parsed = sourceText; }
     let items = [];
-    if(Array.isArray(parsed)){
+    const promptArray = findJsonPromptArray(parsed);
+    if(promptArray){
+        items = promptArray.map(jsonPromptValueToText);
+    } else if(Array.isArray(parsed)){
         items = parsed;
     } else if(parsed && typeof parsed === 'object'){
         const firstArrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
@@ -9803,6 +9796,74 @@ function parseJsonSplitterItems(sourceText){
         items = [parsed];
     }
     return items.map(jsonValueToText);
+}
+const JSON_PROMPT_ARRAY_KEY_RANK = new Map([
+    ['prompts', 0],
+    ['prompt', 1],
+    ['image_prompts', 2],
+    ['imageprompts', 3],
+    ['generated_prompts', 4],
+    ['generatedprompts', 5]
+]);
+const JSON_PROMPT_TEXT_KEYS = ['content', 'prompt', 'text', 'description'];
+function normalizedJsonPromptKey(key){
+    return String(key || '').replace(/[\s-]+/g, '_').toLowerCase();
+}
+function jsonPromptArrayKeyRank(key){
+    const normalized = normalizedJsonPromptKey(key);
+    return JSON_PROMPT_ARRAY_KEY_RANK.has(normalized) ? JSON_PROMPT_ARRAY_KEY_RANK.get(normalized) : Infinity;
+}
+function isJsonPromptArrayKey(key){
+    const normalized = normalizedJsonPromptKey(key);
+    return JSON_PROMPT_ARRAY_KEY_RANK.has(normalized) || normalized.includes('prompt');
+}
+function jsonPromptTextScore(items){
+    if(!Array.isArray(items) || !items.length) return 0;
+    return items.reduce((score, item) => {
+        if(typeof item === 'string' && item.trim()) return score + 2;
+        if(item && typeof item === 'object' && !Array.isArray(item)){
+            return score + JSON_PROMPT_TEXT_KEYS.reduce((sum, key) => {
+                const value = item[key];
+                return sum + (typeof value === 'string' && value.trim() ? 2 : 0);
+            }, 0);
+        }
+        return score;
+    }, 0);
+}
+function collectJsonPromptArrays(value, out=[], seen=new Set()){
+    if(!value || typeof value !== 'object' || seen.has(value)) return out;
+    seen.add(value);
+    if(Array.isArray(value)){
+        value.forEach(item => collectJsonPromptArrays(item, out, seen));
+        return out;
+    }
+    Object.keys(value).forEach(key => {
+        const child = value[key];
+        if(Array.isArray(child) && isJsonPromptArrayKey(key)){
+            out.push({
+                key,
+                items:child,
+                rank:jsonPromptArrayKeyRank(key),
+                score:jsonPromptTextScore(child)
+            });
+        }
+        collectJsonPromptArrays(child, out, seen);
+    });
+    return out;
+}
+function findJsonPromptArray(parsed){
+    const candidates = collectJsonPromptArrays(parsed);
+    if(!candidates.length) return null;
+    candidates.sort((a, b) => (a.rank - b.rank) || (b.score - a.score) || (b.items.length - a.items.length));
+    return candidates[0].items;
+}
+function jsonPromptValueToText(value){
+    if(value && typeof value === 'object' && !Array.isArray(value)){
+        for(const key of JSON_PROMPT_TEXT_KEYS){
+            if(typeof value[key] === 'string' && value[key].trim()) return value[key];
+        }
+    }
+    return jsonValueToText(value);
 }
 function applyJsonSplitterSource(node, sourceText){
     const text = String(sourceText || '');
@@ -11016,7 +11077,7 @@ function jsonValueToText(v){
     return String(v);  // number, boolean
 }
 
-// json 拆分：自动找上游 outputText 中的第一个数组/对象，按元素拆成多输出端口
+// json 拆分：优先拆 prompt 数组；没有 prompt 数组时兼容旧规则，按数组/对象拆成多输出端口
 async function runJsonSplitterNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node) return;
