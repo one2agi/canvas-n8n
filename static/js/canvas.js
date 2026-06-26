@@ -3379,6 +3379,7 @@ function menuAdd(type){
     if(type === 'prompt') addPromptNode(menuPoint);
     if(type === 'loop') addLoopNode(menuPoint);
     if(type === 'llm') addLLMNode(menuPoint);
+    if(type === 'jsonSplitter') addJsonSplitterNode(menuPoint);
     if(type === 'generator') addGeneratorNode(menuPoint);
     if(type === 'msgen') addMsGenNode(menuPoint);
     if(type === 'video') addVideoNode(menuPoint);
