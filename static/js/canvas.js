@@ -7790,7 +7790,7 @@ function llmInputText(node){
         // json-splitter：按 fromPort 索引取对应元素
         if(n.type === 'json-splitter' && Array.isArray(n.sourceItems) && n.sourceItems.length > 0){
             const portIndex = c.fromPort || 0;
-            return n.sourceItems[portIndex] || n.sourceItems[0] || '';
+            return n.sourceItems[portIndex] ?? n.sourceItems[0] ?? '';
         }
         return '';
     }).filter(Boolean).join('\n\n');
@@ -9749,7 +9749,7 @@ function generatorSources(gen){
             // 找从哪个端口连过来 → 取对应的 sourceItem
             const conn = connections.find(c => c.to === gen.id && c.from === n.id);
             const portIndex = conn ? (conn.fromPort || 0) : 0;
-            const item = n.sourceItems[portIndex] || n.sourceItems[0] || '';
+            const item = n.sourceItems[portIndex] ?? n.sourceItems[0] ?? '';
             return {id:`${n.id}:port:${portIndex}`, type:'jsonSplit', label:`[${portIndex}] ${(item || '').slice(0, 32)}${(item || '').length > 32 ? '…' : ''}`, refs:[], prompt:item};
         }
         return null;
@@ -9774,11 +9774,81 @@ function reorderInput(gen, movedId, targetId){
     render();
     scheduleSave();
 }
+function isJsonSplitterNode(node){
+    return node?.type === 'json-extractor' || node?.type === 'json-splitter';
+}
+function jsonSplitterInputText(node){
+    const conn = connections.find(c => c.to === node?.id);
+    if(!conn) return '';
+    const source = nodes.find(n => n.id === conn.from);
+    if(!source) return '';
+    if(isJsonSplitterNode(source) && Array.isArray(source.sourceItems)){
+        const portIndex = conn.fromPort || 0;
+        return source.sourceItems[portIndex] ?? source.sourceItems[0] ?? '';
+    }
+    return source.outputText || '';
+}
+function parseJsonSplitterItems(sourceText){
+    let parsed;
+    try { parsed = JSON.parse(sourceText); }
+    catch(_) { parsed = sourceText; }
+    let items = [];
+    if(Array.isArray(parsed)){
+        items = parsed;
+    } else if(parsed && typeof parsed === 'object'){
+        const firstArrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
+        items = firstArrayKey ? parsed[firstArrayKey] : [parsed];
+    } else {
+        items = [parsed];
+    }
+    return items.map(jsonValueToText);
+}
+function applyJsonSplitterSource(node, sourceText){
+    const text = String(sourceText || '');
+    const nextItems = text ? parseJsonSplitterItems(text) : [];
+    const currentItems = Array.isArray(node.sourceItems) ? node.sourceItems : [];
+    const changed = String(node.sourceText || '') !== text || JSON.stringify(currentItems) !== JSON.stringify(nextItems) || Number(node.outputPorts || 0) !== nextItems.length;
+    if(!changed) return false;
+    node.sourceText = text;
+    node.sourceItems = nextItems;
+    node.outputPorts = nextItems.length;
+    if(text){
+        node.runStatus = 'done';
+        node.runError = '';
+    }
+    return true;
+}
+function syncJsonSplitterInputs(){
+    const changed = new Set();
+    const splitters = nodes.filter(isJsonSplitterNode);
+    for(let pass = 0; pass < Math.max(1, splitters.length); pass++){
+        let passChanged = false;
+        splitters.forEach(node => {
+            if(applyJsonSplitterSource(node, jsonSplitterInputText(node))){
+                changed.add(node.id);
+                passChanged = true;
+            }
+        });
+        if(!passChanged) break;
+    }
+    return [...changed];
+}
 function syncGeneratorInputs(){
+    const changedJsonSplitters = syncJsonSplitterInputs();
     nodes.filter(n => CANVAS_GENERATOR_TYPES.includes(n.type)).forEach(gen => {
         orderedSources(gen, generatorSources(gen));
         if(gen.type === 'ltxDirector') ltxSyncConnectedImagesToTimeline(gen);
     });
+    return changedJsonSplitters;
+}
+function syncJsonSplitterDependents(){
+    const changed = syncGeneratorInputs();
+    if(!changed.length) return changed;
+    refreshNodes(changed);
+    refreshGeneratorInputViews();
+    renderLinks();
+    scheduleSave();
+    return changed;
 }
 // 提示词节点每敲一个字都全量重建所有生成器节点的输入/预览 DOM 会卡顿。节点的 text 已即时写入
 // （运行时实时读取，不受影响），生成器里的预览只需稍后同步一次即可，这里做防抖。
@@ -10883,6 +10953,7 @@ async function runLLMNode(nodeId, opts={}){
     if(!opts.cascade){ node.running = true; refreshNodes([node.id]); }
     try {
         node.outputText = await callCanvasLLM(node, input, [], {cascadeTargetId});
+        syncJsonSplitterDependents();
         if(!opts.cascade) node.running = false;
         node.runStatus = 'done'; node.runError = '';
         refreshNodes([node.id]);
@@ -10960,41 +11031,19 @@ async function runJsonSplitterNode(nodeId, opts={}){
         if(opts.cascade) throw new Error('源节点不存在');
         alert('源节点不存在'); return;
     }
-    if(!sourceNode.outputText){
+    const sourceText = jsonSplitterInputText(node);
+    if(!sourceText){
         if(opts.cascade) throw new Error('源节点还没有输出');
         alert('源节点还没有输出，请先运行它'); return;
     }
 
     if(!opts.cascade){ node.running = true; refreshNodes([node.id]); }
     try {
-        node.sourceText = sourceNode.outputText;
-
-        // 2. 解析 + 自动找第一个数组/对象
-        let parsed;
-        try { parsed = JSON.parse(sourceNode.outputText); }
-        catch(e){
-            // 不是 JSON：整个 outputText 作为 1 个元素
-            parsed = sourceNode.outputText;
-        }
-
-        let items = [];
-        if(Array.isArray(parsed)){
-            items = parsed;
-        } else if(parsed && typeof parsed === 'object'){
-            // 找第一个数组字段；否则整个对象作为 1 个元素
-            const firstArrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-            items = firstArrayKey ? parsed[firstArrayKey] : [parsed];
-        } else {
-            // 字符串/数字/布尔：1 个元素
-            items = [parsed];
-        }
-
-        // 3. 自动 stringify + 设置 sourceItems
-        node.sourceItems = items.map(jsonValueToText);
-        node.outputPorts = node.sourceItems.length;
+        applyJsonSplitterSource(node, sourceText);
         node.runStatus = 'done'; node.runError = '';
 
         if(!opts.cascade) node.running = false;
+        syncJsonSplitterDependents();
         // 触发重渲染（端口数变化 → renderNode 重新插入端口）
         refreshNodes([node.id]);
         scheduleSave();
@@ -11430,6 +11479,7 @@ async function runLLMChat(nodeId){
         const text = await callCanvasLLM(node, message, history);
         node.messages.push({role:'assistant', content:text});
         node.outputText = text;
+        syncJsonSplitterDependents();
         node.running = false;
         refreshNodes([node.id]);
         scheduleSave();
@@ -11447,6 +11497,7 @@ function deleteNode(id, event){
     nodes = nodes.filter(n => n.id !== id);
     connections = connections.filter(c => c.from !== id && c.to !== id);
     selected.delete(id);
+    syncGeneratorInputs();
     render();
     scheduleSave();
 }
