@@ -2606,6 +2606,10 @@ class AutomationWorkflowRunRequest(BaseModel):
 
 AUTOMATION_WORKFLOW_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.-]+$")
 AUTOMATION_RUN_TYPES = {"llm", "json-splitter", "json-extractor", "generator"}
+AUTOMATION_DETECTED_RUN_TYPES = {
+    "llm", "json-splitter", "json-extractor", "generator",
+    "msgen", "comfy", "ltxDirector", "video", "rh",
+}
 AUTOMATION_PROMPT_ARRAY_KEY_RANK = {
     "prompts": 0,
     "prompt": 1,
@@ -2616,6 +2620,30 @@ AUTOMATION_PROMPT_ARRAY_KEY_RANK = {
 }
 AUTOMATION_PROMPT_OBJECT_KEY_RANK = dict(AUTOMATION_PROMPT_ARRAY_KEY_RANK)
 AUTOMATION_PROMPT_TEXT_KEYS = ("content", "prompt", "text", "description")
+
+def automation_detected_node_sort_key(node):
+    item = node or {}
+    return (
+        float(item.get("x") or 0),
+        float(item.get("y") or 0),
+        str(item.get("id") or ""),
+    )
+
+def automation_workflow_bounds_for_nodes(nodes):
+    if not nodes:
+        return {"x": 0, "y": 0, "w": 0, "h": 0}
+    rects = []
+    for node in nodes:
+        x = float(node.get("x") or 0)
+        y = float(node.get("y") or 0)
+        w = float(node.get("w") or 260)
+        h = float(node.get("h") or 200)
+        rects.append((x, y, x + w, y + h))
+    min_x = min(item[0] for item in rects)
+    min_y = min(item[1] for item in rects)
+    max_x = max(item[2] for item in rects)
+    max_y = max(item[3] for item in rects)
+    return {"x": min_x, "y": min_y, "w": max_x - min_x, "h": max_y - min_y}
 
 def automation_json_value_to_text(value):
     if value is None:
@@ -2830,6 +2858,196 @@ def automation_node_map(workflow):
 
 def automation_output_connection_ids(workflow, source_id):
     return [str(conn.get("to") or "") for conn in workflow.get("connections") or [] if str(conn.get("from") or "") == source_id]
+
+def automation_is_detected_runnable_node(node):
+    return (node or {}).get("type") in AUTOMATION_DETECTED_RUN_TYPES
+
+def automation_compute_detected_run_graph(workflow, detected):
+    nodes = workflow.get("nodes") or []
+    connections = workflow.get("connections") or []
+    node_by_id = automation_node_map(workflow)
+    workflow_node_ids = {str(item) for item in detected.get("node_ids") or []}
+    runnable_ids = [
+        str(item)
+        for item in detected.get("runnable_ids") or []
+        if str(item) in workflow_node_ids and automation_is_detected_runnable_node(node_by_id.get(str(item)))
+    ]
+    runnable_set = set(runnable_ids)
+    edges = {node_id: set() for node_id in runnable_ids}
+    indegree = {node_id: 0 for node_id in runnable_ids}
+    incoming_port_rank = {}
+    outgoing = {}
+    for conn in connections:
+        from_id = str(conn.get("from") or "")
+        to_id = str(conn.get("to") or "")
+        if from_id not in workflow_node_ids or to_id not in workflow_node_ids:
+            continue
+        outgoing.setdefault(from_id, []).append(to_id)
+        from_node = node_by_id.get(from_id)
+        if (from_node or {}).get("type") in {"json-splitter", "json-extractor"} and to_id in runnable_set:
+            try:
+                port = float(conn.get("fromPort"))
+            except Exception:
+                port = math.inf
+            incoming_port_rank[to_id] = min(incoming_port_rank.get(to_id, math.inf), port)
+
+    def add_edge(from_id, to_id):
+        if from_id == to_id or from_id not in runnable_set or to_id not in runnable_set:
+            return
+        if to_id in edges[from_id]:
+            return
+        edges[from_id].add(to_id)
+        indegree[to_id] = indegree.get(to_id, 0) + 1
+
+    for from_id in runnable_ids:
+        queue = list(outgoing.get(from_id) or [])
+        seen = set()
+        while queue:
+            next_id = str(queue.pop(0) or "")
+            if next_id in seen or next_id not in workflow_node_ids:
+                continue
+            seen.add(next_id)
+            if next_id in runnable_set:
+                add_edge(from_id, next_id)
+                continue
+            queue.extend(outgoing.get(next_id) or [])
+
+    def sort_key(node_id):
+        port = incoming_port_rank.get(node_id, math.inf)
+        port_key = port if math.isfinite(port) else math.inf
+        return (port_key, *automation_detected_node_sort_key(node_by_id.get(node_id) or {"id": node_id}))
+
+    return {
+        "runnable_ids": runnable_ids,
+        "edges": edges,
+        "indegree": indegree,
+        "sort_key": sort_key,
+    }
+
+def automation_compute_detected_run_order(workflow, detected):
+    graph = automation_compute_detected_run_graph(workflow, detected)
+    runnable_ids = graph["runnable_ids"]
+    indegree = dict(graph["indegree"])
+    ready = sorted([node_id for node_id in runnable_ids if indegree.get(node_id, 0) == 0], key=graph["sort_key"])
+    order = []
+    while ready:
+        node_id = ready.pop(0)
+        order.append(node_id)
+        for to_id in sorted(graph["edges"].get(node_id) or [], key=graph["sort_key"]):
+            indegree[to_id] = indegree.get(to_id, 0) - 1
+            if indegree.get(to_id) == 0:
+                ready.append(to_id)
+        ready.sort(key=graph["sort_key"])
+    missing = sorted([node_id for node_id in runnable_ids if node_id not in order], key=graph["sort_key"])
+    order.extend(missing)
+    return order
+
+def automation_detect_canvas_workflows(workflow):
+    nodes = [node for node in (workflow.get("nodes") or []) if isinstance(node, dict)]
+    connections = [conn for conn in (workflow.get("connections") or []) if isinstance(conn, dict)]
+    node_by_id = {str(node.get("id") or ""): node for node in nodes if node.get("id")}
+    adjacency = {node_id: set() for node_id in node_by_id}
+    for conn in connections:
+        from_id = str(conn.get("from") or "")
+        to_id = str(conn.get("to") or "")
+        if from_id not in node_by_id or to_id not in node_by_id:
+            continue
+        adjacency[from_id].add(to_id)
+        adjacency[to_id].add(from_id)
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        for item_id in node.get("items") or []:
+            item_id = str(item_id or "")
+            if node_id not in node_by_id or item_id not in node_by_id:
+                continue
+            adjacency[node_id].add(item_id)
+            adjacency[item_id].add(node_id)
+
+    visited = set()
+    groups = []
+    for start in sorted(nodes, key=automation_detected_node_sort_key):
+        start_id = str(start.get("id") or "")
+        if not start_id or start_id in visited:
+            continue
+        queue = [start_id]
+        ids = []
+        visited.add(start_id)
+        while queue:
+            node_id = queue.pop(0)
+            ids.append(node_id)
+            for next_id in sorted(adjacency.get(node_id) or []):
+                if next_id in visited:
+                    continue
+                visited.add(next_id)
+                queue.append(next_id)
+        group_nodes = sorted([node_by_id[node_id] for node_id in ids if node_id in node_by_id], key=automation_detected_node_sort_key)
+        runnable_ids = [str(node.get("id") or "") for node in group_nodes if automation_is_detected_runnable_node(node)]
+        if not runnable_ids:
+            continue
+        id_set = {str(node.get("id") or "") for node in group_nodes}
+        group_connections = [
+            conn for conn in connections
+            if str(conn.get("from") or "") in id_set and str(conn.get("to") or "") in id_set
+        ]
+        bounds = automation_workflow_bounds_for_nodes(group_nodes)
+        groups.append({
+            "node_ids": [str(node.get("id") or "") for node in group_nodes],
+            "runnable_ids": runnable_ids,
+            "connection_ids": [str(conn.get("id") or "") for conn in group_connections if conn.get("id")],
+            "node_count": len(group_nodes),
+            "connection_count": len(group_connections),
+            "bounds": bounds,
+            "sort_x": bounds["x"],
+            "sort_y": bounds["y"],
+        })
+
+    groups.sort(key=lambda item: (item["sort_x"], item["sort_y"]))
+    output_ids = {str(node.get("id") or "") for node in nodes if node.get("type") == "output"}
+    image_node_ids = {str(node.get("id") or "") for node in nodes if node.get("type") == "image"}
+    result = []
+    for index, item in enumerate(groups, start=1):
+        workflow_id = f"workflow_{index}"
+        node_id_set = set(item["node_ids"])
+        run_order = automation_compute_detected_run_order(workflow, item)
+        input_image_count = len(image_node_ids.intersection(node_id_set))
+        output_node_count = len(output_ids.intersection(node_id_set))
+        result.append({
+            "workflow_id": workflow_id,
+            "id": workflow_id,
+            "label": f"工作流 {index} · {item['node_count']} 节点 · {item['connection_count']} 连线",
+            "node_ids": item["node_ids"],
+            "runnable_ids": item["runnable_ids"],
+            "connection_ids": item["connection_ids"],
+            "node_count": item["node_count"],
+            "connection_count": item["connection_count"],
+            "bounds": item["bounds"],
+            "run_order": run_order,
+            "input_image_count": input_image_count,
+            "output_node_count": output_node_count,
+        })
+    return result
+
+def automation_canvas_subworkflow_payload(workflow, canvas_workflow_id):
+    workflow_id = str(canvas_workflow_id or "").strip()
+    detected = automation_detect_canvas_workflows(workflow)
+    match = next((item for item in detected if item.get("workflow_id") == workflow_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"画布子工作流不存在：{workflow_id}")
+    node_ids = set(match.get("node_ids") or [])
+    connection_ids = set(match.get("connection_ids") or [])
+    nodes = [copy.deepcopy(node) for node in (workflow.get("nodes") or []) if str(node.get("id") or "") in node_ids]
+    connections = [
+        copy.deepcopy(conn)
+        for conn in (workflow.get("connections") or [])
+        if (str(conn.get("id") or "") in connection_ids)
+        or (str(conn.get("from") or "") in node_ids and str(conn.get("to") or "") in node_ids)
+    ]
+    return {
+        "format": "infinite-canvas-workflow",
+        "nodes": nodes,
+        "connections": connections,
+        "canvas_workflow_id": workflow_id,
+    }
 
 def automation_upstream_image_node_ids(workflow):
     nodes = workflow.get("nodes") or []
