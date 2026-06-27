@@ -148,9 +148,7 @@ body.studio-theme-dark .canvas-meta-pop .emoji-option:hover { background:#263449
 .workflow-run-btn.danger:hover { background:#ef4444; color:#fff; border-color:#ef4444; }
 .workflow-run-btn:disabled { opacity:.45; cursor:not-allowed; transform:none; }
 .node.workflow-active { box-shadow:0 0 0 2px rgba(59,130,246,.65), 0 18px 48px var(--shadow); }
-.node.workflow-dimmed { opacity:.42; }
 .link.workflow-active { stroke:#2563eb; stroke-width:4; opacity:.98; }
-.link.workflow-dimmed { opacity:.16; }
 .workflow-transfer-panel { position:absolute; right:24px; top:124px; bottom:auto; z-index:42; width:390px; max-width:calc(100vw - 48px); max-height:min(430px, calc(100vh - 156px)); min-height:0; display:flex; flex-direction:column; border:1px solid var(--line); border-radius:16px; background:var(--panel); color:var(--text); box-shadow:0 22px 58px var(--shadow); backdrop-filter:blur(18px); overflow:hidden; opacity:0; visibility:hidden; pointer-events:none; transform:translateY(-8px); transition:opacity .16s ease, transform .16s ease, visibility .16s ease; }
 .workflow-transfer-panel.open { opacity:1; visibility:visible; pointer-events:auto; transform:translateY(0); }
 .workflow-transfer-head { min-height:54px; padding:10px 12px 8px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:12px; }

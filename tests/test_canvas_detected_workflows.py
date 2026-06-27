@@ -134,7 +134,7 @@ class CanvasDetectedWorkflowTests(unittest.TestCase):
 
         self.assertNotIn("error", result, msg=result.get("error"))
         self.assertEqual(len(result["workflows"]), 2)
-        self.assertEqual(result["defaultActiveId"], "workflow_1")
+        self.assertEqual(result["defaultActiveId"], result["workflows"][0]["workflowKey"])
         self.assertEqual(result["workflows"][0]["nodeCount"], 6)
         self.assertEqual(result["workflows"][0]["connectionCount"], 6)
         self.assertEqual(result["orders"][0], ["llm_a", "split_a", "gen_a1", "gen_a2"])
@@ -151,7 +151,7 @@ class CanvasDetectedWorkflowTests(unittest.TestCase):
             {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
         ]
         connections = [{"id": "c1", "from": "a_node", "to": "b_node"}]
-        key = "2d5b5b0a2ddb3698"
+        key = "f6a2a1c4a33448bf"
 
         result = run_workflow_algorithm(
             nodes,
@@ -172,6 +172,61 @@ class CanvasDetectedWorkflowTests(unittest.TestCase):
         ]
         moved_result = run_workflow_algorithm(moved, connections)
         self.assertEqual(moved_result["workflows"][0]["workflowKey"], key)
+
+        added = [
+            {"id": "b_node", "type": "generator", "x": 100, "y": 300},
+            {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
+            {"id": "new_api_node", "type": "generator", "x": 300, "y": 300},
+        ]
+        added_connections = [
+            {"id": "c1", "from": "a_node", "to": "b_node"},
+            {"id": "c2", "from": "b_node", "to": "new_api_node"},
+        ]
+        added_result = run_workflow_algorithm(added, added_connections, {key: {"name": "dress-main", "updated_at": 1}})
+        self.assertEqual(added_result["workflows"][0]["workflowKey"], key)
+        self.assertEqual(added_result["workflows"][0]["name"], "dress-main")
+
+    def test_detected_workflow_uses_legacy_key_name_after_node_set_changes(self):
+        legacy_key = "2d5b5b0a2ddb3698"
+        nodes = [
+            {"id": "b_node", "type": "generator", "x": 100, "y": 300},
+            {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
+            {"id": "new_api_node", "type": "generator", "x": 300, "y": 300},
+        ]
+        connections = [
+            {"id": "c1", "from": "a_node", "to": "b_node"},
+            {"id": "c2", "from": "b_node", "to": "new_api_node"},
+        ]
+
+        result = run_workflow_algorithm(
+            nodes,
+            connections,
+            {legacy_key: {"name": "dress-main", "updated_at": 1}},
+        )
+
+        self.assertNotIn("error", result, msg=result.get("error"))
+        workflow = result["workflows"][0]
+        self.assertEqual(workflow["workflowKey"], "f6a2a1c4a33448bf")
+        self.assertEqual(workflow["legacyWorkflowKey"], "8205faccd10ca38c")
+        self.assertEqual(workflow["name"], "dress-main")
+        self.assertEqual(workflow["customName"], "dress-main")
+
+    def test_detected_workflow_preserves_name_when_anchor_node_is_removed(self):
+        key = "f6a2a1c4a33448bf"
+        nodes = [
+            {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
+            {"id": "new_api_node", "type": "generator", "x": 300, "y": 300},
+        ]
+        connections = [{"id": "c2", "from": "a_node", "to": "new_api_node"}]
+
+        result = run_workflow_algorithm(
+            nodes,
+            connections,
+            {key: {"name": "dress-main", "updated_at": 1, "node_ids": ["a_node", "b_node"]}},
+        )
+
+        self.assertNotIn("error", result, msg=result.get("error"))
+        self.assertEqual(result["workflows"][0]["name"], "dress-main")
 
     def test_single_unconnected_runnable_node_is_a_workflow(self):
         nodes = [

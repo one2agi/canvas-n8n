@@ -119,8 +119,37 @@ class AutomationWorkflowApiTests(unittest.TestCase):
         first = main.automation_detect_canvas_workflows(workflow)[0]
         second = main.automation_detect_canvas_workflows(moved)[0]
 
-        self.assertEqual(first["workflow_key"], "2d5b5b0a2ddb3698")
+        self.assertEqual(first["workflow_key"], "f6a2a1c4a33448bf")
+        self.assertEqual(first["legacy_workflow_key"], "2d5b5b0a2ddb3698")
         self.assertEqual(second["workflow_key"], first["workflow_key"])
+
+    def test_detected_workflow_key_is_stable_when_node_is_added(self):
+        workflow = {
+            "nodes": [
+                {"id": "b_node", "type": "generator", "x": 100, "y": 300},
+                {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
+            ],
+            "connections": [{"id": "c1", "from": "a_node", "to": "b_node"}],
+        }
+        added = {
+            "automation_workflow_names": {
+                "f6a2a1c4a33448bf": {"name": "dress-main", "updated_at": 1}
+            },
+            "nodes": workflow["nodes"] + [
+                {"id": "new_api_node", "type": "generator", "x": 300, "y": 300},
+            ],
+            "connections": workflow["connections"] + [
+                {"id": "c2", "from": "b_node", "to": "new_api_node"},
+            ],
+        }
+
+        first = main.automation_detect_canvas_workflows(workflow)[0]
+        second = main.automation_detect_canvas_workflows(added)[0]
+
+        self.assertEqual(first["workflow_key"], "f6a2a1c4a33448bf")
+        self.assertEqual(second["workflow_key"], first["workflow_key"])
+        self.assertEqual(second["legacy_workflow_key"], "8205faccd10ca38c")
+        self.assertEqual(second["name"], "dress-main")
 
     def test_canvas_workflows_include_saved_custom_name(self):
         canvas = {
@@ -140,7 +169,8 @@ class AutomationWorkflowApiTests(unittest.TestCase):
             body = main.automation_canvas_workflow_records("canvas123")
 
         workflow = body["workflows"][0]
-        self.assertEqual(workflow["workflow_key"], "2d5b5b0a2ddb3698")
+        self.assertEqual(workflow["workflow_key"], "f6a2a1c4a33448bf")
+        self.assertEqual(workflow["legacy_workflow_key"], "2d5b5b0a2ddb3698")
         self.assertEqual(workflow["name"], "dress-main")
         self.assertEqual(workflow["custom_name"], "dress-main")
         self.assertEqual(workflow["label"], "dress-main · 2 节点 · 1 连线")
@@ -161,13 +191,45 @@ class AutomationWorkflowApiTests(unittest.TestCase):
         with patch.object(main, "load_canvas", return_value=canvas), \
              patch.object(main, "save_canvas", side_effect=lambda item: saved.append(item)):
             response = client.patch(
-                "/api/automation/canvases/canvas123/workflows/2d5b5b0a2ddb3698/name",
+                "/api/automation/canvases/canvas123/workflows/f6a2a1c4a33448bf/name",
                 json={"name": "dress-main"},
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(saved[0]["automation_workflow_names"]["2d5b5b0a2ddb3698"]["name"], "dress-main")
+        saved_entry = saved[0]["automation_workflow_names"]["f6a2a1c4a33448bf"]
+        self.assertEqual(saved_entry["name"], "dress-main")
+        self.assertEqual(saved_entry["legacy_workflow_key"], "2d5b5b0a2ddb3698")
+        self.assertEqual(saved_entry["anchor_node_id"], "b_node")
+        self.assertEqual(saved_entry["node_ids"], ["a_node", "b_node"])
         self.assertEqual(response.json()["workflow"]["name"], "dress-main")
+
+    def test_patch_canvas_workflow_name_accepts_legacy_key_and_migrates(self):
+        client = TestClient(main.app)
+        canvas = {
+            "id": "canvas123",
+            "title": "kk",
+            "automation_workflow_names": {
+                "2d5b5b0a2ddb3698": {"name": "dress-main", "updated_at": 1}
+            },
+            "nodes": [
+                {"id": "b_node", "type": "generator", "x": 100, "y": 300},
+                {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
+            ],
+            "connections": [{"id": "c1", "from": "a_node", "to": "b_node"}],
+        }
+        saved = []
+
+        with patch.object(main, "load_canvas", return_value=canvas), \
+             patch.object(main, "save_canvas", side_effect=lambda item: saved.append(item)):
+            response = client.patch(
+                "/api/automation/canvases/canvas123/workflows/2d5b5b0a2ddb3698/name",
+                json={"name": "dress-updated"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        names = saved[0]["automation_workflow_names"]
+        self.assertNotIn("2d5b5b0a2ddb3698", names)
+        self.assertEqual(names["f6a2a1c4a33448bf"]["name"], "dress-updated")
 
     def test_patch_canvas_workflow_name_rejects_duplicate_name(self):
         client = TestClient(main.app)
@@ -294,6 +356,39 @@ class AutomationWorkflowApiTests(unittest.TestCase):
         task = main.AUTOMATION_WORKFLOW_TASKS[response.json()["task_id"]]
         self.assertEqual(task["canvas_workflow_id"], "workflow_2")
         self.assertEqual({node["id"] for node in task["workflow"]["nodes"]}, {"img_b", "gen_b", "out_b"})
+
+    def test_create_workflow_run_loads_canvas_subworkflow_by_workflow_key(self):
+        client = TestClient(main.app)
+        canvas = {
+            "id": "canvas123",
+            "title": "kk",
+            "nodes": [
+                {"id": "prompt_a", "type": "prompt", "x": 0, "y": 0},
+                {"id": "gen_a", "type": "generator", "x": 200, "y": 0},
+                {"id": "out_a", "type": "output", "x": 400, "y": 0},
+            ],
+            "connections": [
+                {"id": "c1", "from": "prompt_a", "to": "gen_a"},
+                {"id": "c2", "from": "gen_a", "to": "out_a"},
+            ],
+        }
+
+        def fake_create_task(coro):
+            coro.close()
+            return object()
+
+        with patch.object(main, "load_canvas", return_value=canvas), \
+             patch.object(main.asyncio, "create_task", side_effect=fake_create_task):
+            response = client.post("/api/automation/workflow-runs", json={
+                "canvas_id": "canvas123",
+                "canvas_workflow_id": "dfdbf54527499d49",
+                "image_urls": ["https://example.com/product.png"],
+            })
+
+        self.assertEqual(response.status_code, 200)
+        task = main.AUTOMATION_WORKFLOW_TASKS[response.json()["task_id"]]
+        self.assertEqual(task["canvas_workflow_id"], "workflow_1")
+        self.assertEqual(task["workflow"]["canvas_workflow_key"], "dfdbf54527499d49")
 
     def test_create_workflow_run_loads_selected_canvas_subworkflow_by_name(self):
         client = TestClient(main.app)

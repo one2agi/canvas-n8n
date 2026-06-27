@@ -5470,6 +5470,7 @@ function render(){
     const outputScrolls = captureOutputScrolls();
     const mediaStates = captureMediaPlaybackStates();
     const reusableMediaNodes = new Map();
+    syncDetectedWorkflowState();
     nodesEl.querySelectorAll('.node').forEach(el => {
         const node = nodes.find(n => n.id === el.dataset.id);
         if(nodeHasLiveMedia(node)) reusableMediaNodes.set(node.id, el);
@@ -5506,6 +5507,7 @@ function refreshNodes(ids=[]){
     const uniqueIds = [...new Set((ids || []).filter(Boolean))];
     if(!uniqueIds.length) return;
     const outputScrolls = captureOutputScrolls();
+    syncDetectedWorkflowState();
     applyViewport();
     for(const id of uniqueIds){
         const node = nodes.find(n => n.id === id);
@@ -5666,8 +5668,7 @@ function renderNode(node){
     const hasFixedSize = Boolean(node.h || size.h);
     const activeWorkflowNodes = activeDetectedWorkflowNodeSet();
     const workflowActive = activeWorkflowNodes.has(node.id);
-    const workflowDimmed = activeWorkflowNodes.size > 0 && !workflowActive;
-    el.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} ${hasFixedSize ? 'sized' : ''} ${selected.has(node.id) ? 'selected' : ''} ${workflowActive ? 'workflow-active' : ''} ${workflowDimmed ? 'workflow-dimmed' : ''}`;
+    el.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} ${hasFixedSize ? 'sized' : ''} ${selected.has(node.id) ? 'selected' : ''} ${workflowActive ? 'workflow-active' : ''}`;
     el.style.left = `${node.x}px`;
     el.style.top = `${node.y}px`;
     el.style.width = `${node.w || size.w}px`;
@@ -13272,17 +13273,65 @@ function detectedWorkflowKey(nodeIds){
     const values = (nodeIds || []).map(id => String(id || '')).filter(Boolean).sort();
     return values.length ? detectedWorkflowSha1Hex(values.join('|')).slice(0, 16) : '';
 }
+function detectedWorkflowKeyForAnchor(anchorNodeId){
+    const value = String(anchorNodeId || '').trim();
+    return value ? detectedWorkflowSha1Hex(value).slice(0, 16) : '';
+}
 function detectedWorkflowNameEntries(){
     const raw = canvas?.automation_workflow_names || {};
     return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
 }
-function detectedWorkflowDisplay(index, workflowKey, nodeCount, connectionCount){
+function normalizedDetectedWorkflowNameEntry(entry){
+    const item = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {name: entry};
+    const name = String(item?.name || '').trim().slice(0, 80);
+    if(!name) return null;
+    const rawNodeIds = item.node_ids || item.nodeIds || [];
+    return {
+        name,
+        updated_at: Number(item.updated_at || 0) || 0,
+        legacy_workflow_key: String(item.legacy_workflow_key || item.legacyWorkflowKey || '').trim(),
+        anchor_node_id: String(item.anchor_node_id || item.anchorNodeId || '').trim(),
+        node_ids: Array.isArray(rawNodeIds) ? rawNodeIds.map(id => String(id || '')).filter(Boolean) : []
+    };
+}
+function detectedWorkflowNameEntryFor(workflowKey, legacyWorkflowKey, nodeIds){
+    const entries = detectedWorkflowNameEntries();
+    const direct = normalizedDetectedWorkflowNameEntry(entries?.[workflowKey]);
+    if(direct) return {...direct, matchedKey: workflowKey};
+    const legacy = normalizedDetectedWorkflowNameEntry(entries?.[legacyWorkflowKey]);
+    if(legacy) return {...legacy, matchedKey: legacyWorkflowKey};
+    const values = (nodeIds || []).map(id => String(id || '')).filter(Boolean).sort();
+    for(const removed of values){
+        const previousValues = values.filter(id => id !== removed);
+        const previousKey = previousValues.length ? detectedWorkflowSha1Hex(previousValues.join('|')).slice(0, 16) : '';
+        const previous = normalizedDetectedWorkflowNameEntry(entries?.[previousKey]);
+        if(previous) return {...previous, matchedKey: previousKey};
+    }
+    const currentIds = new Set((nodeIds || []).map(id => String(id || '')).filter(Boolean));
+    let best = null;
+    Object.entries(entries || {}).forEach(([key, raw]) => {
+        const entry = normalizedDetectedWorkflowNameEntry(raw);
+        if(!entry?.node_ids?.length || !currentIds.size) return;
+        const savedIds = new Set(entry.node_ids);
+        let overlap = 0;
+        savedIds.forEach(id => { if(currentIds.has(id)) overlap += 1; });
+        const score = overlap / Math.max(savedIds.size, currentIds.size);
+        const threshold = Math.min(savedIds.size, currentIds.size) <= 2 ? 0.5 : 0.6;
+        if(overlap < 1 || score < threshold) return;
+        const candidate = {score, updated_at:entry.updated_at, key, entry};
+        if(!best || candidate.score > best.score || (candidate.score === best.score && candidate.updated_at > best.updated_at)) best = candidate;
+    });
+    return best ? {...best.entry, matchedKey: best.key} : null;
+}
+function detectedWorkflowDisplay(index, workflowKey, legacyWorkflowKey, nodeIds, nodeCount, connectionCount){
     const defaultName = `工作流 ${index}`;
-    const customName = String(detectedWorkflowNameEntries()?.[workflowKey]?.name || '').trim();
+    const entry = detectedWorkflowNameEntryFor(workflowKey, legacyWorkflowKey, nodeIds);
+    const customName = String(entry?.name || '').trim();
     const name = customName || defaultName;
     return {
         name,
         customName,
+        matchedNameKey: entry?.matchedKey || '',
         label: `${name} · ${nodeCount} 节点 · ${connectionCount} 连线`
     };
 }
@@ -13290,6 +13339,22 @@ function detectedWorkflowNodeSort(a, b){
     return (safeDetectedWorkflowNumber(a.x, 0) - safeDetectedWorkflowNumber(b.x, 0))
         || (safeDetectedWorkflowNumber(a.y, 0) - safeDetectedWorkflowNumber(b.y, 0))
         || String(a.id).localeCompare(String(b.id));
+}
+function detectedWorkflowCreatedRank(node){
+    const id = String(node?.id || '');
+    const match = id.match(/_(\d{10,})$/);
+    return [match ? Number(match[1]) : Infinity, node || {id}];
+}
+function detectedWorkflowAnchorNodeId(groupNodes){
+    const runnable = (groupNodes || []).filter(isDetectedWorkflowRunnableNode);
+    const candidates = runnable.length ? runnable : (groupNodes || []);
+    if(!candidates.length) return '';
+    return [...candidates].sort((a, b) => {
+        const [aCreated, aNode] = detectedWorkflowCreatedRank(a);
+        const [bCreated, bNode] = detectedWorkflowCreatedRank(b);
+        if(aCreated !== bCreated) return aCreated - bCreated;
+        return detectedWorkflowNodeSort(aNode, bNode);
+    })[0]?.id || '';
 }
 function detectCanvasWorkflows(){
     const nodeList = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
@@ -13332,11 +13397,16 @@ function detectCanvasWorkflows(){
         const bounds = workflowBoundsForNodes(groupNodes);
         const index = groups.length + 1;
         const nodeIds = groupNodes.map(node => node.id);
-        const workflowKey = detectedWorkflowKey(nodeIds);
-        const display = detectedWorkflowDisplay(index, workflowKey, groupNodes.length, groupConnections.length);
+        const anchorNodeId = detectedWorkflowAnchorNodeId(groupNodes);
+        const workflowKey = detectedWorkflowKeyForAnchor(anchorNodeId);
+        const legacyWorkflowKey = detectedWorkflowKey(nodeIds);
+        const display = detectedWorkflowDisplay(index, workflowKey, legacyWorkflowKey, nodeIds, groupNodes.length, groupConnections.length);
         groups.push({
             id: `workflow_${index}`,
             workflowKey,
+            legacyWorkflowKey,
+            matchedNameKey: display.matchedNameKey,
+            anchorNodeId,
             name: display.name,
             customName: display.customName,
             label: display.label,
@@ -13353,12 +13423,13 @@ function detectCanvasWorkflows(){
     return groups.sort((a, b) => (a.sortX - b.sortX) || (a.sortY - b.sortY) || a.id.localeCompare(b.id))
         .map((workflow, index) => {
             const workflowId = `workflow_${index + 1}`;
-            const display = detectedWorkflowDisplay(index + 1, workflow.workflowKey, workflow.nodeCount, workflow.connectionCount);
+            const display = detectedWorkflowDisplay(index + 1, workflow.workflowKey, workflow.legacyWorkflowKey, workflow.nodeIds, workflow.nodeCount, workflow.connectionCount);
             return {
                 ...workflow,
                 id: workflowId,
                 name: display.name,
                 customName: display.customName,
+                matchedNameKey: display.matchedNameKey,
                 label: display.label
             };
         });
@@ -13378,7 +13449,16 @@ function workflowBoundsForNodes(list){
     return {x:minX, y:minY, w:maxX - minX, h:maxY - minY};
 }
 function activeDetectedWorkflow(){
-    return detectedWorkflows.find(workflow => workflow.id === activeDetectedWorkflowId) || null;
+    return findDetectedWorkflow(activeDetectedWorkflowId);
+}
+function findDetectedWorkflow(value){
+    const key = String(value || '');
+    return detectedWorkflows.find(workflow =>
+        workflow.id === key
+        || workflow.workflowKey === key
+        || workflow.legacyWorkflowKey === key
+        || workflow.matchedNameKey === key
+    ) || null;
 }
 function activeDetectedWorkflowNodeSet(){
     return new Set(activeDetectedWorkflow()?.nodeIds || []);
@@ -13500,16 +13580,27 @@ function computeWorkflowRunPlan(workflow){
 }
 function chooseDetectedWorkflowActiveId(currentId, workflows){
     const list = Array.isArray(workflows) ? workflows : [];
-    if(currentId && list.some(workflow => workflow.id === currentId)) return currentId;
-    return list[0]?.id || '';
+    if(currentId){
+        const current = list.find(workflow =>
+            workflow.workflowKey === currentId
+            || workflow.id === currentId
+            || workflow.legacyWorkflowKey === currentId
+            || workflow.matchedNameKey === currentId
+        );
+        if(current) return current.workflowKey || current.id || '';
+    }
+    return list[0]?.workflowKey || list[0]?.id || '';
+}
+function syncDetectedWorkflowState(){
+    detectedWorkflows = detectCanvasWorkflows();
+    activeDetectedWorkflowId = chooseDetectedWorkflowActiveId(activeDetectedWorkflowId, detectedWorkflows);
 }
 function renderWorkflowRunBar(){
     if(!workflowRunBar || !workflowRunSelect) return;
-    detectedWorkflows = detectCanvasWorkflows();
-    activeDetectedWorkflowId = chooseDetectedWorkflowActiveId(activeDetectedWorkflowId, detectedWorkflows);
+    syncDetectedWorkflowState();
     workflowRunBar.classList.toggle('empty', detectedWorkflows.length === 0);
     workflowRunSelect.innerHTML = detectedWorkflows.length
-        ? detectedWorkflows.map(workflow => `<option value="${escapeAttr(workflow.id)}" ${workflow.id === activeDetectedWorkflowId ? 'selected' : ''}>${escapeHtml(workflow.label)}</option>`).join('')
+        ? detectedWorkflows.map(workflow => `<option value="${escapeAttr(workflow.workflowKey || workflow.id)}" ${(workflow.workflowKey || workflow.id) === activeDetectedWorkflowId ? 'selected' : ''}>${escapeHtml(workflow.label)}</option>`).join('')
         : '<option value="">未识别到可运行工作流</option>';
     const active = activeDetectedWorkflow();
     const running = Boolean(active && isCascadeActive(active.id));
@@ -13521,8 +13612,9 @@ function renderWorkflowRunBar(){
     refreshIcons();
 }
 function selectDetectedWorkflow(workflowId){
-    const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
-    activeDetectedWorkflowId = workflow?.id || '';
+    syncDetectedWorkflowState();
+    const workflow = findDetectedWorkflow(workflowId);
+    activeDetectedWorkflowId = workflow?.workflowKey || workflow?.id || '';
     selected.clear();
     (workflow?.nodeIds || []).forEach(id => selected.add(id));
     refreshSelectionVisuals();
@@ -13530,13 +13622,15 @@ function selectDetectedWorkflow(workflowId){
     renderWorkflowRunBar();
 }
 function locateDetectedWorkflow(workflowId=activeDetectedWorkflowId){
-    const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
+    syncDetectedWorkflowState();
+    const workflow = findDetectedWorkflow(workflowId);
     if(!workflow) return;
     const workflowNodes = workflow.nodeIds.map(id => nodes.find(node => node.id === id)).filter(Boolean);
     if(!workflowNodes.length) return;
     zoomToNodes(workflowNodes);
 }
 async function renameDetectedWorkflow(){
+    syncDetectedWorkflowState();
     const workflow = activeDetectedWorkflow();
     if(!workflow || !workflow.workflowKey || !canvas?.id) return;
     const nextName = window.prompt('工作流名称', workflow.customName || workflow.name || '');
@@ -13551,8 +13645,27 @@ async function renameDetectedWorkflow(){
         const data = await res.json();
         canvas.automation_workflow_names = canvas.automation_workflow_names || {};
         const clean = String(nextName || '').trim().slice(0, 80);
-        if(clean) canvas.automation_workflow_names[workflow.workflowKey] = {name: clean, updated_at: Date.now()};
-        else delete canvas.automation_workflow_names[workflow.workflowKey];
+        const responseWorkflow = data.workflow || workflow;
+        const canonicalKey = responseWorkflow.workflowKey || responseWorkflow.workflow_key || workflow.workflowKey;
+        const oldKeys = new Set([
+            workflow.workflowKey,
+            workflow.legacyWorkflowKey,
+            workflow.matchedNameKey,
+            responseWorkflow.legacyWorkflowKey || responseWorkflow.legacy_workflow_key,
+            responseWorkflow.matchedNameKey || responseWorkflow.matched_name_key,
+        ].filter(key => key && key !== canonicalKey));
+        if(clean) {
+            canvas.automation_workflow_names[canonicalKey] = {
+                name: clean,
+                updated_at: Date.now(),
+                legacy_workflow_key: responseWorkflow.legacyWorkflowKey || responseWorkflow.legacy_workflow_key || workflow.legacyWorkflowKey || '',
+                anchor_node_id: responseWorkflow.anchorNodeId || responseWorkflow.anchor_node_id || workflow.anchorNodeId || '',
+                node_ids: responseWorkflow.nodeIds || responseWorkflow.node_ids || workflow.nodeIds || []
+            };
+        } else {
+            delete canvas.automation_workflow_names[canonicalKey];
+        }
+        oldKeys.forEach(key => delete canvas.automation_workflow_names[key]);
         if(Number(data.updated_at || 0)){
             canvas.updated_at = Number(data.updated_at);
             lastCanvasUpdatedAt = canvas.updated_at;
@@ -13562,6 +13675,9 @@ async function renameDetectedWorkflow(){
             ...item,
             id: item.id || item.workflow_id,
             workflowKey: item.workflowKey || item.workflow_key,
+            legacyWorkflowKey: item.legacyWorkflowKey || item.legacy_workflow_key,
+            matchedNameKey: item.matchedNameKey || item.matched_name_key || '',
+            anchorNodeId: item.anchorNodeId || item.anchor_node_id || '',
             customName: item.customName ?? item.custom_name ?? '',
             nodeIds: item.nodeIds || item.node_ids || [],
             runnableIds: item.runnableIds || item.runnable_ids || [],
@@ -13576,7 +13692,8 @@ async function renameDetectedWorkflow(){
     }
 }
 async function runDetectedWorkflow(workflowId=activeDetectedWorkflowId){
-    const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
+    syncDetectedWorkflowState();
+    const workflow = findDetectedWorkflow(workflowId);
     if(!workflow) return;
     if(isCascadeActive(workflow.id)) return;
     const plan = computeWorkflowRunPlan(workflow);
@@ -13585,7 +13702,7 @@ async function runDetectedWorkflow(workflowId=activeDetectedWorkflowId){
         alert('该工作流没有可运行节点');
         return;
     }
-    selectDetectedWorkflow(workflow.id);
+    selectDetectedWorkflow(workflow.workflowKey || workflow.id);
     const ctx = beginCascade(workflow.id, order, {mode:'detected-workflow-parallel'});
     renderWorkflowRunBar();
     try {
@@ -14328,8 +14445,7 @@ function renderLinks(){
     const activeWorkflowConnections = activeDetectedWorkflowConnectionSet();
     segments.forEach(({c, a, b}) => {
         const workflowActive = activeWorkflowConnections.has(c.id);
-        const workflowDimmed = activeWorkflowConnections.size > 0 && !workflowActive;
-        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link ${workflowActive ? 'workflow-active' : ''} ${workflowDimmed ? 'workflow-dimmed' : ''}`));
+        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link ${workflowActive ? 'workflow-active' : ''}`));
         linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
     });
@@ -14417,7 +14533,6 @@ function refreshSelectionVisuals(){
         el.classList.toggle('selected', selected.has(el.dataset.id));
         const workflowActive = activeWorkflowNodes.has(el.dataset.id);
         el.classList.toggle('workflow-active', workflowActive);
-        el.classList.toggle('workflow-dimmed', activeWorkflowNodes.size > 0 && !workflowActive);
     });
     renderLinks();
     renderSelectionHub();

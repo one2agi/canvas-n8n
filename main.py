@@ -2972,6 +2972,23 @@ def automation_workflow_key_for_node_ids(node_ids):
     values = sorted(str(node_id or "") for node_id in (node_ids or []) if str(node_id or ""))
     return hashlib.sha1("|".join(values).encode("utf-8")).hexdigest()[:16] if values else ""
 
+def automation_workflow_key_for_anchor_node(anchor_node_id):
+    value = str(anchor_node_id or "").strip()
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16] if value else ""
+
+def automation_node_created_rank(node):
+    node_id = str((node or {}).get("id") or "")
+    match = re.search(r"_(\d{10,})$", node_id)
+    created = int(match.group(1)) if match else math.inf
+    return (created, *automation_detected_node_sort_key(node or {"id": node_id}))
+
+def automation_workflow_anchor_node_id(group_nodes):
+    runnable = [node for node in (group_nodes or []) if automation_is_detected_runnable_node(node)]
+    candidates = runnable or list(group_nodes or [])
+    if not candidates:
+        return ""
+    return str(sorted(candidates, key=automation_node_created_rank)[0].get("id") or "")
+
 def automation_canvas_workflow_name_entries(canvas_or_workflow):
     raw = (canvas_or_workflow or {}).get("automation_workflow_names") or {}
     if not isinstance(raw, dict):
@@ -2985,11 +3002,49 @@ def automation_canvas_workflow_name_entries(canvas_or_workflow):
         name = str(item.get("name") or "").strip()[:80]
         if not name:
             continue
+        node_ids = item.get("node_ids") or item.get("nodeIds") or []
+        if not isinstance(node_ids, list):
+            node_ids = []
         entries[workflow_key] = {
             "name": name,
             "updated_at": int(item.get("updated_at") or 0),
+            "legacy_workflow_key": str(item.get("legacy_workflow_key") or item.get("legacyWorkflowKey") or "").strip(),
+            "anchor_node_id": str(item.get("anchor_node_id") or item.get("anchorNodeId") or "").strip(),
+            "node_ids": [str(node_id or "") for node_id in node_ids if str(node_id or "")],
         }
     return entries
+
+def automation_workflow_name_entry_for_detected(workflow_names, detected_item):
+    workflow_names = workflow_names or {}
+    workflow_key = str((detected_item or {}).get("workflow_key") or "")
+    legacy_key = str((detected_item or {}).get("legacy_workflow_key") or "")
+    if workflow_key in workflow_names:
+        return workflow_names[workflow_key], workflow_key
+    if legacy_key in workflow_names:
+        return workflow_names[legacy_key], legacy_key
+    node_ids = set(str(node_id or "") for node_id in ((detected_item or {}).get("node_ids") or []) if str(node_id or ""))
+    values = sorted(node_ids)
+    for removed in values:
+        previous_values = [node_id for node_id in values if node_id != removed]
+        previous_key = automation_workflow_key_for_node_ids(previous_values)
+        if previous_key in workflow_names:
+            return workflow_names[previous_key], previous_key
+    best = None
+    for key, entry in workflow_names.items():
+        saved_ids = set(str(node_id or "") for node_id in (entry.get("node_ids") or []) if str(node_id or ""))
+        if not saved_ids or not node_ids:
+            continue
+        overlap = len(saved_ids.intersection(node_ids))
+        score = overlap / max(len(saved_ids), len(node_ids))
+        threshold = 0.5 if min(len(saved_ids), len(node_ids)) <= 2 else 0.6
+        if overlap < 1 or score < threshold:
+            continue
+        candidate = (score, int(entry.get("updated_at") or 0), key, entry)
+        if best is None or candidate > best:
+            best = candidate
+    if best:
+        return best[3], best[2]
+    return {}, ""
 
 def automation_named_workflow_label(name, fallback_name, node_count, connection_count):
     display = str(name or fallback_name or "工作流").strip()
@@ -3064,9 +3119,18 @@ def automation_detect_canvas_workflows(workflow, workflow_names=None):
     result = []
     for index, item in enumerate(groups, start=1):
         workflow_id = f"workflow_{index}"
-        workflow_key = automation_workflow_key_for_node_ids(item["node_ids"])
+        group_nodes = [node_by_id[node_id] for node_id in item["node_ids"] if node_id in node_by_id]
+        anchor_node_id = automation_workflow_anchor_node_id(group_nodes)
+        workflow_key = automation_workflow_key_for_anchor_node(anchor_node_id)
+        legacy_workflow_key = automation_workflow_key_for_node_ids(item["node_ids"])
         default_name = f"工作流 {index}"
-        custom_name = str((workflow_names.get(workflow_key) or {}).get("name") or "").strip()
+        name_entry, matched_name_key = automation_workflow_name_entry_for_detected(workflow_names, {
+            **item,
+            "workflow_key": workflow_key,
+            "legacy_workflow_key": legacy_workflow_key,
+            "anchor_node_id": anchor_node_id,
+        })
+        custom_name = str((name_entry or {}).get("name") or "").strip()
         name = custom_name or default_name
         node_id_set = set(item["node_ids"])
         run_order = automation_compute_detected_run_order(workflow, item)
@@ -3076,6 +3140,9 @@ def automation_detect_canvas_workflows(workflow, workflow_names=None):
             "workflow_id": workflow_id,
             "id": workflow_id,
             "workflow_key": workflow_key,
+            "legacy_workflow_key": legacy_workflow_key,
+            "matched_name_key": matched_name_key,
+            "anchor_node_id": anchor_node_id,
             "name": name,
             "custom_name": custom_name,
             "label": automation_named_workflow_label(name, default_name, item["node_count"], item["connection_count"]),
@@ -3095,7 +3162,15 @@ def automation_find_canvas_workflow(detected, canvas_workflow_id="", canvas_work
     workflow_id = str(canvas_workflow_id or "").strip()
     workflow_name = str(canvas_workflow_name or "").strip()
     if workflow_id:
-        match = next((item for item in detected if item.get("workflow_id") == workflow_id), None)
+        match = next((
+            item for item in detected
+            if workflow_id in {
+                str(item.get("workflow_id") or ""),
+                str(item.get("workflow_key") or ""),
+                str(item.get("legacy_workflow_key") or ""),
+                str(item.get("matched_name_key") or ""),
+            }
+        ), None)
         if not match:
             raise HTTPException(status_code=404, detail=f"画布子工作流不存在：{workflow_id}")
         return match
@@ -3106,6 +3181,44 @@ def automation_find_canvas_workflow(detected, canvas_workflow_id="", canvas_work
         if len(matches) > 1:
             raise HTTPException(status_code=409, detail=f"画布子工作流名称重复：{workflow_name}")
         return matches[0]
+    return None
+
+def automation_find_detected_workflow_by_key(detected, workflow_key, workflow_names=None):
+    key = str(workflow_key or "").strip()
+    if not key:
+        return None
+    for item in detected or []:
+        if key in {
+            str(item.get("workflow_key") or ""),
+            str(item.get("legacy_workflow_key") or ""),
+            str(item.get("matched_name_key") or ""),
+        }:
+            return item
+    entry = (workflow_names or {}).get(key)
+    entry_name = str((entry or {}).get("name") or "").strip()
+    entry_node_ids = set(str(node_id or "") for node_id in ((entry or {}).get("node_ids") or []) if str(node_id or ""))
+    if entry_node_ids:
+        matches = []
+        for item in detected or []:
+            item_node_ids = set(str(node_id or "") for node_id in (item.get("node_ids") or []) if str(node_id or ""))
+            if not item_node_ids:
+                continue
+            overlap = len(entry_node_ids.intersection(item_node_ids))
+            if overlap / max(len(entry_node_ids), len(item_node_ids)) >= 0.6:
+                matches.append((overlap, item))
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            matches.sort(key=lambda pair: pair[0], reverse=True)
+            if matches[0][0] > matches[1][0]:
+                return matches[0][1]
+    if entry_name:
+        matches = [
+            item for item in detected or []
+            if str(item.get("custom_name") or "").strip().casefold() == entry_name.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 def automation_canvas_subworkflow_payload(workflow, canvas_workflow_id="", canvas_workflow_name=""):
@@ -3128,6 +3241,7 @@ def automation_canvas_subworkflow_payload(workflow, canvas_workflow_id="", canva
         "connections": connections,
         "canvas_workflow_id": match.get("workflow_id") or "",
         "canvas_workflow_key": match.get("workflow_key") or "",
+        "canvas_legacy_workflow_key": match.get("legacy_workflow_key") or "",
         "canvas_workflow_name": match.get("custom_name") or "",
     }
 
@@ -3440,27 +3554,46 @@ def automation_update_canvas_workflow_name(canvas_id, workflow_key, name):
         "automation_workflow_names": entries,
     }
     detected = automation_detect_canvas_workflows(workflow)
-    if not any(item.get("workflow_key") == key for item in detected):
+    match = automation_find_detected_workflow_by_key(detected, key, entries)
+    if not match:
         raise HTTPException(status_code=404, detail=f"画布子工作流不存在：{key}")
+    canonical_key = str(match.get("workflow_key") or key)
+    old_keys = {
+        key,
+        str(match.get("legacy_workflow_key") or ""),
+        str(match.get("matched_name_key") or ""),
+    }
+    old_keys.discard(canonical_key)
+    old_keys.discard("")
     clean_name = str(name or "").strip()[:80]
     if clean_name:
         duplicate = next(
             (
                 item for item in detected
-                if item.get("workflow_key") != key
+                if item.get("workflow_key") != canonical_key
                 and str(item.get("name") or "").strip().casefold() == clean_name.casefold()
             ),
             None,
         )
         if duplicate:
             raise HTTPException(status_code=409, detail=f"画布子工作流名称已存在：{clean_name}")
-        entries[key] = {"name": clean_name, "updated_at": now_ms()}
+        entries[canonical_key] = {
+            "name": clean_name,
+            "updated_at": now_ms(),
+            "legacy_workflow_key": str(match.get("legacy_workflow_key") or ""),
+            "anchor_node_id": str(match.get("anchor_node_id") or ""),
+            "node_ids": [str(node_id or "") for node_id in (match.get("node_ids") or []) if str(node_id or "")],
+        }
+        for old_key in old_keys:
+            entries.pop(old_key, None)
     else:
-        entries.pop(key, None)
+        entries.pop(canonical_key, None)
+        for old_key in old_keys:
+            entries.pop(old_key, None)
     canvas["automation_workflow_names"] = entries
     save_canvas(canvas)
     refreshed = automation_canvas_workflow_records(canvas_id)
-    workflow_record = next((item for item in refreshed.get("workflows") or [] if item.get("workflow_key") == key), None)
+    workflow_record = next((item for item in refreshed.get("workflows") or [] if item.get("workflow_key") == canonical_key), None)
     return {
         "workflow": workflow_record,
         "workflows": refreshed.get("workflows") or [],
