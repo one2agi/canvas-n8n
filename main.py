@@ -2876,6 +2876,7 @@ def automation_compute_detected_run_graph(workflow, detected):
     edges = {node_id: set() for node_id in runnable_ids}
     indegree = {node_id: 0 for node_id in runnable_ids}
     incoming_port_rank = {}
+    splitter_port_starts = []
     outgoing = {}
     for conn in connections:
         from_id = str(conn.get("from") or "")
@@ -2884,12 +2885,25 @@ def automation_compute_detected_run_graph(workflow, detected):
             continue
         outgoing.setdefault(from_id, []).append(to_id)
         from_node = node_by_id.get(from_id)
-        if (from_node or {}).get("type") in {"json-splitter", "json-extractor"} and to_id in runnable_set:
+        if (from_node or {}).get("type") in {"json-splitter", "json-extractor"}:
             try:
                 port = float(conn.get("fromPort"))
             except Exception:
                 port = math.inf
-            incoming_port_rank[to_id] = min(incoming_port_rank.get(to_id, math.inf), port)
+            splitter_port_starts.append((to_id, port))
+
+    for start_id, port in splitter_port_starts:
+        queue = [start_id]
+        seen = set()
+        while queue:
+            next_id = str(queue.pop(0) or "")
+            if next_id in seen or next_id not in workflow_node_ids:
+                continue
+            seen.add(next_id)
+            if next_id in runnable_set:
+                incoming_port_rank[next_id] = min(incoming_port_rank.get(next_id, math.inf), port)
+                continue
+            queue.extend(outgoing.get(next_id) or [])
 
     def add_edge(from_id, to_id):
         if from_id == to_id or from_id not in runnable_set or to_id not in runnable_set:
