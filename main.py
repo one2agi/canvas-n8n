@@ -3102,11 +3102,20 @@ def automation_is_internal_asset_url(url):
     value = str(url or "").strip()
     return value.startswith("/assets/input/") or value.startswith("/assets/output/") or value.startswith("/output/")
 
+def automation_decoded_internal_asset_path(url):
+    path = urllib.parse.urlsplit(str(url or "").strip()).path
+    for _ in range(5):
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    return path.replace("\\", "/")
+
 def automation_validate_internal_asset_url(url):
     value = str(url or "").strip()
     if not automation_is_internal_asset_url(value):
         raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{value}")
-    if ".." in value.replace("\\", "/").split("/"):
+    if ".." in automation_decoded_internal_asset_path(value).split("/"):
         raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
     return value
 

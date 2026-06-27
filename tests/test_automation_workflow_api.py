@@ -124,23 +124,42 @@ class AutomationWorkflowApiTests(unittest.TestCase):
 
     def test_automation_upload_saves_input_asset(self):
         client = TestClient(main.app)
+        uploaded = b"fake-image-bytes"
 
         with tempfile.TemporaryDirectory() as temp_dir, \
              patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
             response = client.post(
                 "/api/automation/upload",
-                files={"file": ("product.png", b"fake-image-bytes", "image/png")},
+                files={"file": ("product.png", uploaded, "image/png")},
             )
 
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertTrue(body["url"].startswith("/assets/input/automation_"))
-        self.assertEqual(body["name"], "product.png")
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertTrue(body["url"].startswith("/assets/input/automation_"))
+            self.assertEqual(body["name"], "product.png")
+            saved_name = os.path.basename(body["url"])
+            saved_path = os.path.join(temp_dir, saved_name)
+            self.assertTrue(os.path.exists(saved_path))
+            with open(saved_path, "rb") as f:
+                self.assertEqual(f.read(), uploaded)
 
     def test_prepare_input_images_accepts_internal_asset_url(self):
         result = asyncio.run(main.automation_prepare_input_images(["/assets/input/product.png"]))
 
         self.assertEqual(result, ["/assets/input/product.png"])
+
+    def test_prepare_input_images_rejects_encoded_internal_traversal(self):
+        urls = [
+            "/assets/input/%2e%2e/output/a.png",
+            "/assets/input/%252e%252e/output/a.png",
+            "/assets/input/%5c..%5coutput/a.png",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                with self.assertRaises(main.HTTPException) as context:
+                    asyncio.run(main.automation_prepare_input_images([url]))
+
+                self.assertEqual(context.exception.status_code, 400)
 
 
 if __name__ == "__main__":
