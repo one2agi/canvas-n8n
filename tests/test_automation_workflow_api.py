@@ -31,6 +31,40 @@ def png_bytes():
 PNG_BYTES = png_bytes()
 
 
+class FakeStreamResponse:
+    def __init__(self, content, content_type="image/png", chunks=None):
+        self.content = content
+        self.headers = {"content-type": content_type, "content-length": str(len(content))}
+        self._chunks = chunks or [content]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class FakeAsyncClient:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method, url):
+        return self.response
+
+
 class AutomationWorkflowApiTests(unittest.TestCase):
     def setUp(self):
         main.AUTOMATION_WORKFLOW_TASKS.clear()
@@ -238,6 +272,47 @@ class AutomationWorkflowApiTests(unittest.TestCase):
                 asyncio.run(main.automation_prepare_input_images(["/assets/input/note.txt"]))
 
         self.assertEqual(context.exception.status_code, 400)
+
+    def test_prepare_input_images_rejects_fake_png_internal_asset_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
+            with open(os.path.join(temp_dir, "fake.png"), "wb") as f:
+                f.write(b"not a real png")
+            with self.assertRaises(main.HTTPException) as context:
+                asyncio.run(main.automation_prepare_input_images(["/assets/input/fake.png"]))
+
+        self.assertEqual(context.exception.status_code, 400)
+
+    def test_prepare_input_images_rejects_remote_non_image_response_without_saving(self):
+        fake_response = FakeStreamResponse(b"not an image", content_type="text/plain")
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir), \
+             patch.object(main.httpx, "AsyncClient", return_value=FakeAsyncClient(fake_response)):
+            with self.assertRaises(main.HTTPException) as context:
+                asyncio.run(main.automation_prepare_input_images(["https://example.com/fake.png"]))
+
+            self.assertEqual(os.listdir(temp_dir), [])
+
+        self.assertEqual(context.exception.status_code, 400)
+
+    def test_prepare_input_images_rejects_remote_oversized_response_without_saving(self):
+        fake_response = FakeStreamResponse(
+            PNG_BYTES + b"x",
+            content_type="image/png",
+            chunks=[PNG_BYTES, b"x"],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir), \
+             patch.object(main, "LOCAL_IMAGE_IMPORT_MAX_BYTES", len(PNG_BYTES)), \
+             patch.object(main.httpx, "AsyncClient", return_value=FakeAsyncClient(fake_response)):
+            with self.assertRaises(main.HTTPException) as context:
+                asyncio.run(main.automation_prepare_input_images(["https://example.com/product.png"]))
+
+            self.assertEqual(os.listdir(temp_dir), [])
+
+        self.assertEqual(context.exception.status_code, 413)
 
     def test_prepare_input_images_rejects_encoded_internal_traversal(self):
         urls = [

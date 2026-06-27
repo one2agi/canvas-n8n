@@ -3111,6 +3111,62 @@ def automation_decoded_internal_asset_path(url):
         path = decoded
     return path.replace("\\", "/")
 
+def automation_image_extension_from_source(name="", content_type=""):
+    mime = str(content_type or "").split(";", 1)[0].strip().lower()
+    ext = (os.path.splitext(str(name or ""))[1] or mimetypes.guess_extension(mime or "") or "").lower()
+    if ext == ".jpe":
+        ext = ".jpg"
+    return ext
+
+def automation_validate_image_metadata(name="", content_type=""):
+    mime = str(content_type or "").split(";", 1)[0].strip().lower()
+    ext = automation_image_extension_from_source(name, mime)
+    if ext not in LOCAL_IMAGE_IMPORT_EXTS or not mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="仅支持 PNG、JPG、JPEG、WEBP、GIF 图片")
+    return ext, mime
+
+def automation_verify_image_bytes(content):
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+    except Exception:
+        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
+
+def automation_validate_image_bytes(content, name="", content_type=""):
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    if len(content) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+    ext, _mime = automation_validate_image_metadata(name, content_type)
+    automation_verify_image_bytes(content)
+    return ext
+
+def automation_validate_image_file(path):
+    if not content_type_for_path(path).startswith("image/"):
+        raise HTTPException(status_code=400, detail="内部资源不是图片")
+    try:
+        if os.path.getsize(path) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+        with Image.open(path) as img:
+            img.verify()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
+
+async def automation_read_upload_image_content(file):
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 def automation_internal_asset_path_parts(url):
     decoded_path = automation_decoded_internal_asset_path(url)
     mappings = (
@@ -3138,6 +3194,7 @@ def automation_internal_asset_file_path(url):
         raise HTTPException(status_code=400, detail=f"内部资源图片不存在：{value}")
     if not content_type_for_path(target).startswith("image/"):
         raise HTTPException(status_code=400, detail=f"内部资源不是图片：{value}")
+    automation_validate_image_file(target)
     return target
 
 def automation_validate_internal_asset_url(url):
@@ -3323,16 +3380,34 @@ async def automation_prepare_input_images(image_urls):
                 continue
             if not url.startswith(("http://", "https://")):
                 raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{url}")
-            response = await client.get(url)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            ext = mimetypes.guess_extension(content_type) or os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".png"
-            if ext == ".jpe":
-                ext = ".jpg"
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                ext, _mime = automation_validate_image_metadata(urllib.parse.urlparse(url).path, content_type)
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+                            raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+                    except HTTPException:
+                        raise
+                    except ValueError:
+                        raise HTTPException(status_code=400, detail="远程图片响应不合法")
+                chunks = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+                    chunks.append(chunk)
+            content = b"".join(chunks)
+            automation_validate_image_bytes(content, urllib.parse.urlparse(url).path, content_type)
             filename = f"automation_{int(time.time())}_{uuid.uuid4().hex[:8]}_{index}{ext}"
             target = os.path.join(OUTPUT_INPUT_DIR, filename)
             with open(target, "wb") as f:
-                f.write(response.content)
+                f.write(content)
             prepared.append(f"/assets/input/{filename}")
     return prepared
 
@@ -12336,23 +12411,11 @@ async def create_automation_workflow_run(payload: AutomationWorkflowRunRequest):
 
 @app.post("/api/automation/upload")
 async def upload_automation_input(file: UploadFile = File(...)):
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="上传文件为空")
     original_name = file.filename or "automation-input.png"
     content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
-    ext = (os.path.splitext(original_name)[1] or mimetypes.guess_extension(content_type or "") or "").lower()
-    if ext == ".jpe":
-        ext = ".jpg"
-    if ext not in LOCAL_IMAGE_IMPORT_EXTS or not content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="仅支持 PNG、JPG、JPEG、WEBP、GIF 图片")
-    if len(content) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
-    try:
-        with Image.open(BytesIO(content)) as img:
-            img.verify()
-    except Exception:
-        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
+    automation_validate_image_metadata(original_name, content_type)
+    content = await automation_read_upload_image_content(file)
+    ext = automation_validate_image_bytes(content, original_name, content_type)
     filename = f"automation_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
     os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
     target = os.path.join(OUTPUT_INPUT_DIR, filename)
