@@ -23,7 +23,7 @@ def _extract_workflow_algorithm(code: str) -> str:
 
 def _extract_cascade_layer_runner(code: str) -> str:
     start = code.index("async function runCascadeNodeOnce(")
-    end = code.index("// 失败重试：从该节点继续往下游跑", start)
+    end = code.index("async function retryNodeAndDownstream(", start)
     return code[start:end]
 
 
@@ -156,6 +156,19 @@ class CanvasDetectedWorkflowTests(unittest.TestCase):
         self.assertEqual(result["workflows"][0]["nodeIds"], ["gen_solo"])
         self.assertEqual(result["orders"][0], ["gen_solo"])
         self.assertEqual(result["plans"][0]["layers"], [["gen_solo"]])
+
+    def test_malformed_coordinates_use_backend_fallbacks(self):
+        nodes = [
+            {"id": "gen_bad", "type": "generator", "x": "bad", "y": float("inf"), "w": "wide", "h": "tall"},
+            {"id": "gen_next", "type": "generator", "x": 400, "y": 10},
+        ]
+        result = run_workflow_algorithm(nodes, [])
+
+        self.assertNotIn("error", result, msg=result.get("error"))
+        self.assertEqual([workflow["id"] for workflow in result["workflows"]], ["workflow_1", "workflow_2"])
+        self.assertEqual(result["workflows"][0]["nodeIds"], ["gen_bad"])
+        self.assertEqual(result["workflows"][0]["bounds"], {"x": 0, "y": 0, "w": 260, "h": 200})
+        self.assertEqual(result["orders"], [["gen_bad"], ["gen_next"]])
 
     def test_connected_group_includes_its_member_image_nodes(self):
         nodes = [

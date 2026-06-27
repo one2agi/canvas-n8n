@@ -13230,8 +13230,16 @@ const DETECTED_WORKFLOW_RUN_TYPES = new Set(['llm', 'json-splitter', 'json-extra
 function isDetectedWorkflowRunnableNode(node){
     return DETECTED_WORKFLOW_RUN_TYPES.has(node?.type);
 }
+function safeDetectedWorkflowNumber(value, fallback=0){
+    if(value === null || value === undefined) return fallback;
+    if(typeof value === 'string' && value.trim() === '') return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
 function detectedWorkflowNodeSort(a, b){
-    return (Number(a.x || 0) - Number(b.x || 0)) || (Number(a.y || 0) - Number(b.y || 0)) || String(a.id).localeCompare(String(b.id));
+    return (safeDetectedWorkflowNumber(a.x, 0) - safeDetectedWorkflowNumber(b.x, 0))
+        || (safeDetectedWorkflowNumber(a.y, 0) - safeDetectedWorkflowNumber(b.y, 0))
+        || String(a.id).localeCompare(String(b.id));
 }
 function detectCanvasWorkflows(){
     const nodeList = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
@@ -13296,10 +13304,10 @@ function detectCanvasWorkflows(){
 function workflowBoundsForNodes(list){
     if(!list.length) return {x:0, y:0, w:0, h:0};
     const rects = list.map(node => ({
-        x: Number(node.x || 0),
-        y: Number(node.y || 0),
-        w: Number(node.w || 260),
-        h: Number(node.h || 200)
+        x: safeDetectedWorkflowNumber(node.x, 0),
+        y: safeDetectedWorkflowNumber(node.y, 0),
+        w: safeDetectedWorkflowNumber(node.w, 260),
+        h: safeDetectedWorkflowNumber(node.h, 200)
     }));
     const minX = Math.min(...rects.map(r => r.x));
     const minY = Math.min(...rects.map(r => r.y));

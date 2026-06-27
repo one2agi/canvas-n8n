@@ -3062,7 +3062,9 @@ def automation_canvas_subworkflow_payload(workflow, canvas_workflow_id):
     connections = [
         copy.deepcopy(conn)
         for conn in (workflow.get("connections") or [])
-        if str(conn.get("from") or "") in node_ids and str(conn.get("to") or "") in node_ids
+        if isinstance(conn, dict)
+        and str(conn.get("from") or "") in node_ids
+        and str(conn.get("to") or "") in node_ids
     ]
     return {
         "format": "infinite-canvas-workflow",
