@@ -177,6 +177,7 @@ const minimap = document.getElementById('minimap');
 const minimapContent = document.getElementById('minimapContent');
 let minimapViewport = document.getElementById('minimapViewport');
 const linksEl = document.getElementById('links');
+const linkOverlaysEl = document.getElementById('linkOverlays');
 const linkControlsEl = document.getElementById('linkControls');
 const dropOverlay = document.getElementById('dropOverlay');
 const createMenu = document.getElementById('createMenu');
@@ -977,6 +978,7 @@ function setCanvasMode(open){
     if(!open){
         nodesEl.innerHTML = '';
         linksEl.innerHTML = '';
+        if(linkOverlaysEl) linkOverlaysEl.innerHTML = '';
         linkControlsEl.innerHTML = '';
         selectionHub.classList.remove('open');
     } else if(currentCanvasTitle) {
@@ -14428,8 +14430,15 @@ function canResolvePort(id){
     // 只跳过“真正的孤儿连线”（端点节点已不存在）；节点存在但暂时没 DOM 的，portPoint 会用几何坐标兜底。
     return Boolean(nodes.find(x => x.id === id));
 }
+function needsLinkOverlay(connection){
+    const fromNode = nodes.find(n => n.id === connection?.from);
+    if(!fromNode || !['json-splitter', 'json-extractor'].includes(fromNode.type)) return false;
+    const hasDynamicPorts = Number(fromNode.outputPorts || 0) > 0 || (Array.isArray(fromNode.sourceItems) && fromNode.sourceItems.length > 0);
+    return hasDynamicPorts || connection?.fromPort !== undefined;
+}
 function renderLinks(){
     linksEl.innerHTML = '';
+    if(linkOverlaysEl) linkOverlaysEl.innerHTML = '';
     linkControlsEl.innerHTML = '';
     // 先批量读取所有端点坐标（portPoint 里有 getBoundingClientRect），再统一写入 DOM。
     // 否则“读一条 rect → append 一条线”交错进行，每次 append 都让布局失效，下一次读 rect 就触发一次
@@ -14446,6 +14455,9 @@ function renderLinks(){
     segments.forEach(({c, a, b}) => {
         const workflowActive = activeWorkflowConnections.has(c.id);
         linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link ${workflowActive ? 'workflow-active' : ''}`));
+        if(linkOverlaysEl && needsLinkOverlay(c)){
+            linkOverlaysEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link link-overlay ${workflowActive ? 'workflow-active' : ''}`));
+        }
         linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
     });
