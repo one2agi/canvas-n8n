@@ -1,4 +1,5 @@
 import json
+import copy
 import uuid
 import base64
 import hashlib
@@ -216,6 +217,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None):
 CLIENT_ID = str(uuid.uuid4())
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_DIR = os.path.join(BASE_DIR, "workflows")
+AUTOMATION_WORKFLOW_DIR = os.path.join(BASE_DIR, "automation_workflows")
 WORKFLOW_PATH = os.path.join(WORKFLOW_DIR, "Z-Image.json")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 STATIC_RUNNINGHUB_DIR = os.path.join(STATIC_DIR, "runninghub")
@@ -523,7 +525,7 @@ VIDEO_POLL_TIMEOUT = float(os.getenv("VIDEO_POLL_TIMEOUT", "1800"))
 ONLINE_IMAGE_PROMPT_MAX_LENGTH = int(os.getenv("ONLINE_IMAGE_PROMPT_MAX_LENGTH", "20000"))
 VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
 LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 CHAT_ATTACHMENT_MAX = int(os.getenv("CHAT_ATTACHMENT_MAX", "20"))
 ONLINE_IMAGE_REFERENCE_MAX = int(os.getenv("ONLINE_IMAGE_REFERENCE_MAX", "20"))
 
@@ -1347,6 +1349,7 @@ os.makedirs(ASSET_LIBRARY_DIR, exist_ok=True)
 os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(WORKFLOW_DIR, exist_ok=True)
+os.makedirs(AUTOMATION_WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
 
@@ -2594,6 +2597,1238 @@ class CanvasWorkflowExportRequest(BaseModel):
     category_id: str = ""
     name: str = ""
 
+class AutomationWorkflowRunRequest(BaseModel):
+    workflow: Dict[str, Any] = Field(default_factory=dict)
+    workflow_name: str = ""
+    canvas_id: str = ""
+    canvas_workflow_id: str = ""
+    canvas_workflow_name: str = ""
+    image_urls: List[str] = []
+    callback_url: str = ""
+
+class AutomationCanvasWorkflowNameUpdate(BaseModel):
+    name: str = ""
+
+AUTOMATION_WORKFLOW_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.-]+$")
+AUTOMATION_RUN_TYPES = {"llm", "json-splitter", "json-extractor", "generator"}
+AUTOMATION_DETECTED_RUN_TYPES = {
+    "llm", "json-splitter", "json-extractor", "generator",
+    "msgen", "comfy", "ltxDirector", "video", "rh",
+}
+AUTOMATION_PROMPT_ARRAY_KEY_RANK = {
+    "prompts": 0,
+    "prompt": 1,
+    "image_prompts": 2,
+    "imageprompts": 3,
+    "generated_prompts": 4,
+    "generatedprompts": 5,
+}
+AUTOMATION_PROMPT_OBJECT_KEY_RANK = dict(AUTOMATION_PROMPT_ARRAY_KEY_RANK)
+AUTOMATION_PROMPT_TEXT_KEYS = ("content", "prompt", "text", "description")
+
+def automation_detected_safe_number(value, fallback=0):
+    try:
+        number = float(value)
+    except Exception:
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+def automation_detected_node_sort_key(node):
+    item = node or {}
+    return (
+        automation_detected_safe_number(item.get("x"), 0),
+        automation_detected_safe_number(item.get("y"), 0),
+        str(item.get("id") or ""),
+    )
+
+def automation_workflow_bounds_for_nodes(nodes):
+    if not nodes:
+        return {"x": 0, "y": 0, "w": 0, "h": 0}
+    rects = []
+    for node in nodes:
+        x = automation_detected_safe_number(node.get("x"), 0)
+        y = automation_detected_safe_number(node.get("y"), 0)
+        w = automation_detected_safe_number(node.get("w"), 260)
+        h = automation_detected_safe_number(node.get("h"), 200)
+        rects.append((x, y, x + w, y + h))
+    min_x = min(item[0] for item in rects)
+    min_y = min(item[1] for item in rects)
+    max_x = max(item[2] for item in rects)
+    max_y = max(item[3] for item in rects)
+    return {"x": min_x, "y": min_y, "w": max_x - min_x, "h": max_y - min_y}
+
+def automation_json_value_to_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value)
+
+def automation_normalized_prompt_key(key):
+    return re.sub(r"[\s-]+", "_", str(key or "")).lower()
+
+def automation_strip_json_markdown_fence(text):
+    value = str(text or "").strip()
+    match = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", value, re.IGNORECASE)
+    return match.group(1).strip() if match else value
+
+def automation_extract_balanced_json_text(text):
+    source = automation_strip_json_markdown_fence(text)
+    starts = [idx for idx in (source.find("{"), source.find("[")) if idx >= 0]
+    if not starts:
+        return source
+    start = min(starts)
+    stack = []
+    in_string = False
+    escape = False
+    for index in range(start, len(source)):
+        ch = source[index]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch in "}]":
+            if not stack:
+                return source
+            open_ch = stack.pop()
+            if (ch == "}" and open_ch != "{") or (ch == "]" and open_ch != "["):
+                return source
+            if not stack:
+                return source[start:index + 1].strip()
+    return source
+
+def automation_parse_json_for_splitter(source_text):
+    raw = str(source_text or "")
+    candidates = [raw, automation_strip_json_markdown_fence(raw), automation_extract_balanced_json_text(raw)]
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    return source_text
+
+def automation_prompt_array_key_rank(key):
+    normalized = automation_normalized_prompt_key(key)
+    return AUTOMATION_PROMPT_ARRAY_KEY_RANK.get(normalized, math.inf)
+
+def automation_numbered_prompt_key_index(key):
+    match = re.match(r"^prompt_?(\d+)(?:_|$)", automation_normalized_prompt_key(key))
+    return int(match.group(1)) if match else None
+
+def automation_is_prompt_array_key(key):
+    normalized = automation_normalized_prompt_key(key)
+    return normalized in AUTOMATION_PROMPT_ARRAY_KEY_RANK or "prompt" in normalized
+
+def automation_is_prompt_object_key(key):
+    return automation_is_prompt_array_key(key)
+
+def automation_prompt_text_score(items):
+    if not isinstance(items, list) or not items:
+        return 0
+    score = 0
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            score += 2
+        elif isinstance(item, dict):
+            for key in AUTOMATION_PROMPT_TEXT_KEYS:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    score += 2
+    return score
+
+def automation_numbered_prompt_items_from_object(value):
+    if not isinstance(value, dict):
+        return None
+    entries = []
+    for key, child in value.items():
+        index = automation_numbered_prompt_key_index(key)
+        if index is not None:
+            entries.append((index, str(key), child))
+    if len(entries) < 2:
+        return None
+    entries.sort(key=lambda item: (item[0], item[1]))
+    items = [item[2] for item in entries]
+    return {
+        "kind": "numbered-object",
+        "key": ",".join(item[1] for item in entries),
+        "items": items,
+        "rank": math.inf,
+        "score": automation_prompt_text_score(items),
+    }
+
+def automation_collect_prompt_arrays(value, out=None, seen=None):
+    out = out if out is not None else []
+    seen = seen if seen is not None else set()
+    if not isinstance(value, (dict, list)):
+        return out
+    marker = id(value)
+    if marker in seen:
+        return out
+    seen.add(marker)
+    if isinstance(value, list):
+        for item in value:
+            automation_collect_prompt_arrays(item, out, seen)
+        return out
+    numbered_items = automation_numbered_prompt_items_from_object(value)
+    if numbered_items:
+        out.append(numbered_items)
+    for key, child in value.items():
+        if isinstance(child, list) and automation_is_prompt_array_key(key):
+            out.append({
+                "kind": "array",
+                "key": key,
+                "items": child,
+                "rank": automation_prompt_array_key_rank(key),
+                "score": automation_prompt_text_score(child),
+            })
+        elif isinstance(child, dict) and automation_is_prompt_object_key(key):
+            out.append({
+                "kind": "object",
+                "key": key,
+                "items": list(child.values()),
+                "rank": automation_prompt_array_key_rank(key),
+                "score": automation_prompt_text_score(list(child.values())),
+            })
+        automation_collect_prompt_arrays(child, out, seen)
+    return out
+
+def automation_find_prompt_array(parsed):
+    candidates = automation_collect_prompt_arrays(parsed)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item["rank"], -item["score"], -len(item["items"])))
+    return candidates[0]
+
+def automation_prompt_value_to_text(value):
+    if isinstance(value, dict):
+        # 1) 标准键优先：content / prompt / text / description
+        for key in AUTOMATION_PROMPT_TEXT_KEYS:
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+        # 2) 兜底：没有标准键时，从所有字符串值里挑**最长**的
+        #    适用场景：{无文字主图版, 带文字广告版} / {v1, v2} / {main, alt} 等
+        #    「最长」= 最可能是完整 prompt 文本（短的通常是标题/摘要）
+        string_values = [v for v in value.values() if isinstance(v, str) and v.strip()]
+        if string_values:
+            return max(string_values, key=len)
+    return automation_json_value_to_text(value)
+
+def automation_parse_markdown_prompt_sections(source_text):
+    text = str(source_text or "").strip()
+    if not text:
+        return []
+    pattern = re.compile(r"(?im)^#{1,4}\s*Prompt\s*\d+\s*[：:.-]?.*$")
+    matches = list(pattern.finditer(text))
+    if len(matches) < 2:
+        return []
+    sections = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            sections.append(body)
+    return sections
+
+def automation_parse_json_prompt_items(source_text):
+    parsed = automation_parse_json_for_splitter(source_text)
+    container = automation_find_prompt_array(parsed)
+    if container is not None:
+        items = [automation_prompt_value_to_text(item) for item in container["items"]]
+    elif isinstance(parsed, list):
+        items = [automation_json_value_to_text(item) for item in parsed]
+    elif isinstance(parsed, dict):
+        first_array = next((value for value in parsed.values() if isinstance(value, list)), None)
+        source_items = first_array if first_array is not None else [parsed]
+        items = [automation_json_value_to_text(item) for item in source_items]
+    else:
+        markdown_items = automation_parse_markdown_prompt_sections(parsed)
+        items = markdown_items or [automation_json_value_to_text(parsed)]
+    return [str(item or "").strip() for item in items if str(item or "").strip()]
+
+def automation_node_map(workflow):
+    return {str(node.get("id") or ""): node for node in workflow.get("nodes") or [] if isinstance(node, dict)}
+
+def automation_output_connection_ids(workflow, source_id):
+    return [str(conn.get("to") or "") for conn in workflow.get("connections") or [] if str(conn.get("from") or "") == source_id]
+
+def automation_is_detected_runnable_node(node):
+    return (node or {}).get("type") in AUTOMATION_DETECTED_RUN_TYPES
+
+def automation_compute_detected_run_graph(workflow, detected):
+    nodes = workflow.get("nodes") or []
+    connections = workflow.get("connections") or []
+    node_by_id = automation_node_map(workflow)
+    workflow_node_ids = {str(item) for item in detected.get("node_ids") or []}
+    runnable_ids = [
+        str(item)
+        for item in detected.get("runnable_ids") or []
+        if str(item) in workflow_node_ids and automation_is_detected_runnable_node(node_by_id.get(str(item)))
+    ]
+    runnable_set = set(runnable_ids)
+    edges = {node_id: set() for node_id in runnable_ids}
+    indegree = {node_id: 0 for node_id in runnable_ids}
+    incoming_port_rank = {}
+    splitter_port_starts = []
+    outgoing = {}
+    for conn in connections:
+        from_id = str(conn.get("from") or "")
+        to_id = str(conn.get("to") or "")
+        if from_id not in workflow_node_ids or to_id not in workflow_node_ids:
+            continue
+        outgoing.setdefault(from_id, []).append(to_id)
+        from_node = node_by_id.get(from_id)
+        if (from_node or {}).get("type") in {"json-splitter", "json-extractor"}:
+            try:
+                port = float(conn.get("fromPort"))
+            except Exception:
+                port = math.inf
+            splitter_port_starts.append((to_id, port))
+
+    for start_id, port in splitter_port_starts:
+        queue = [start_id]
+        seen = set()
+        while queue:
+            next_id = str(queue.pop(0) or "")
+            if next_id in seen or next_id not in workflow_node_ids:
+                continue
+            seen.add(next_id)
+            if next_id in runnable_set:
+                incoming_port_rank[next_id] = min(incoming_port_rank.get(next_id, math.inf), port)
+                continue
+            queue.extend(outgoing.get(next_id) or [])
+
+    def add_edge(from_id, to_id):
+        if from_id == to_id or from_id not in runnable_set or to_id not in runnable_set:
+            return
+        if to_id in edges[from_id]:
+            return
+        edges[from_id].add(to_id)
+        indegree[to_id] = indegree.get(to_id, 0) + 1
+
+    for from_id in runnable_ids:
+        queue = list(outgoing.get(from_id) or [])
+        seen = set()
+        while queue:
+            next_id = str(queue.pop(0) or "")
+            if next_id in seen or next_id not in workflow_node_ids:
+                continue
+            seen.add(next_id)
+            if next_id in runnable_set:
+                add_edge(from_id, next_id)
+                continue
+            queue.extend(outgoing.get(next_id) or [])
+
+    def sort_key(node_id):
+        port = incoming_port_rank.get(node_id, math.inf)
+        port_key = port if math.isfinite(port) else math.inf
+        return (port_key, *automation_detected_node_sort_key(node_by_id.get(node_id) or {"id": node_id}))
+
+    return {
+        "runnable_ids": runnable_ids,
+        "edges": edges,
+        "indegree": indegree,
+        "sort_key": sort_key,
+    }
+
+def automation_compute_detected_run_order(workflow, detected):
+    graph = automation_compute_detected_run_graph(workflow, detected)
+    runnable_ids = graph["runnable_ids"]
+    indegree = dict(graph["indegree"])
+    ready = sorted([node_id for node_id in runnable_ids if indegree.get(node_id, 0) == 0], key=graph["sort_key"])
+    order = []
+    while ready:
+        node_id = ready.pop(0)
+        order.append(node_id)
+        for to_id in sorted(graph["edges"].get(node_id) or [], key=graph["sort_key"]):
+            indegree[to_id] = indegree.get(to_id, 0) - 1
+            if indegree.get(to_id) == 0:
+                ready.append(to_id)
+        ready.sort(key=graph["sort_key"])
+    missing = sorted([node_id for node_id in runnable_ids if node_id not in order], key=graph["sort_key"])
+    order.extend(missing)
+    return order
+
+def automation_workflow_key_for_node_ids(node_ids):
+    values = sorted(str(node_id or "") for node_id in (node_ids or []) if str(node_id or ""))
+    return hashlib.sha1("|".join(values).encode("utf-8")).hexdigest()[:16] if values else ""
+
+def automation_workflow_key_for_anchor_node(anchor_node_id):
+    value = str(anchor_node_id or "").strip()
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16] if value else ""
+
+def automation_node_created_rank(node):
+    node_id = str((node or {}).get("id") or "")
+    match = re.search(r"_(\d{10,})$", node_id)
+    created = int(match.group(1)) if match else math.inf
+    return (created, *automation_detected_node_sort_key(node or {"id": node_id}))
+
+def automation_workflow_anchor_node_id(group_nodes):
+    runnable = [node for node in (group_nodes or []) if automation_is_detected_runnable_node(node)]
+    candidates = runnable or list(group_nodes or [])
+    if not candidates:
+        return ""
+    return str(sorted(candidates, key=automation_node_created_rank)[0].get("id") or "")
+
+def automation_canvas_workflow_name_entries(canvas_or_workflow):
+    raw = (canvas_or_workflow or {}).get("automation_workflow_names") or {}
+    if not isinstance(raw, dict):
+        return {}
+    entries = {}
+    for key, value in raw.items():
+        workflow_key = str(key or "").strip()
+        if not workflow_key:
+            continue
+        item = value if isinstance(value, dict) else {"name": value}
+        name = str(item.get("name") or "").strip()[:80]
+        if not name:
+            continue
+        node_ids = item.get("node_ids") or item.get("nodeIds") or []
+        if not isinstance(node_ids, list):
+            node_ids = []
+        entries[workflow_key] = {
+            "name": name,
+            "updated_at": int(item.get("updated_at") or 0),
+            "legacy_workflow_key": str(item.get("legacy_workflow_key") or item.get("legacyWorkflowKey") or "").strip(),
+            "anchor_node_id": str(item.get("anchor_node_id") or item.get("anchorNodeId") or "").strip(),
+            "node_ids": [str(node_id or "") for node_id in node_ids if str(node_id or "")],
+        }
+    return entries
+
+def automation_workflow_name_entry_for_detected(workflow_names, detected_item):
+    workflow_names = workflow_names or {}
+    workflow_key = str((detected_item or {}).get("workflow_key") or "")
+    legacy_key = str((detected_item or {}).get("legacy_workflow_key") or "")
+    if workflow_key in workflow_names:
+        return workflow_names[workflow_key], workflow_key
+    if legacy_key in workflow_names:
+        return workflow_names[legacy_key], legacy_key
+    node_ids = set(str(node_id or "") for node_id in ((detected_item or {}).get("node_ids") or []) if str(node_id or ""))
+    values = sorted(node_ids)
+    for removed in values:
+        previous_values = [node_id for node_id in values if node_id != removed]
+        previous_key = automation_workflow_key_for_node_ids(previous_values)
+        if previous_key in workflow_names:
+            return workflow_names[previous_key], previous_key
+    best = None
+    for key, entry in workflow_names.items():
+        saved_ids = set(str(node_id or "") for node_id in (entry.get("node_ids") or []) if str(node_id or ""))
+        if not saved_ids or not node_ids:
+            continue
+        overlap = len(saved_ids.intersection(node_ids))
+        score = overlap / max(len(saved_ids), len(node_ids))
+        threshold = 0.5 if min(len(saved_ids), len(node_ids)) <= 2 else 0.6
+        if overlap < 1 or score < threshold:
+            continue
+        candidate = (score, int(entry.get("updated_at") or 0), key, entry)
+        if best is None or candidate > best:
+            best = candidate
+    if best:
+        return best[3], best[2]
+    return {}, ""
+
+def automation_named_workflow_label(name, fallback_name, node_count, connection_count):
+    display = str(name or fallback_name or "工作流").strip()
+    return f"{display} · {node_count} 节点 · {connection_count} 连线"
+
+def automation_detect_canvas_workflows(workflow, workflow_names=None):
+    workflow_names = workflow_names if workflow_names is not None else automation_canvas_workflow_name_entries(workflow)
+    nodes = [node for node in (workflow.get("nodes") or []) if isinstance(node, dict)]
+    connections = [conn for conn in (workflow.get("connections") or []) if isinstance(conn, dict)]
+    node_by_id = {str(node.get("id") or ""): node for node in nodes if node.get("id")}
+    adjacency = {node_id: set() for node_id in node_by_id}
+    for conn in connections:
+        from_id = str(conn.get("from") or "")
+        to_id = str(conn.get("to") or "")
+        if from_id not in node_by_id or to_id not in node_by_id:
+            continue
+        adjacency[from_id].add(to_id)
+        adjacency[to_id].add(from_id)
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        items = node.get("items")
+        if not isinstance(items, list):
+            continue
+        for item_id in items:
+            item_id = str(item_id or "")
+            if node_id not in node_by_id or item_id not in node_by_id:
+                continue
+            adjacency[node_id].add(item_id)
+            adjacency[item_id].add(node_id)
+
+    visited = set()
+    groups = []
+    for start in sorted(nodes, key=automation_detected_node_sort_key):
+        start_id = str(start.get("id") or "")
+        if not start_id or start_id in visited:
+            continue
+        queue = [start_id]
+        ids = []
+        visited.add(start_id)
+        while queue:
+            node_id = queue.pop(0)
+            ids.append(node_id)
+            for next_id in sorted(adjacency.get(node_id) or []):
+                if next_id in visited:
+                    continue
+                visited.add(next_id)
+                queue.append(next_id)
+        group_nodes = sorted([node_by_id[node_id] for node_id in ids if node_id in node_by_id], key=automation_detected_node_sort_key)
+        runnable_ids = [str(node.get("id") or "") for node in group_nodes if automation_is_detected_runnable_node(node)]
+        if not runnable_ids:
+            continue
+        id_set = {str(node.get("id") or "") for node in group_nodes}
+        group_connections = [
+            conn for conn in connections
+            if str(conn.get("from") or "") in id_set and str(conn.get("to") or "") in id_set
+        ]
+        bounds = automation_workflow_bounds_for_nodes(group_nodes)
+        groups.append({
+            "node_ids": [str(node.get("id") or "") for node in group_nodes],
+            "runnable_ids": runnable_ids,
+            "connection_ids": [str(conn.get("id") or "") for conn in group_connections if conn.get("id")],
+            "node_count": len(group_nodes),
+            "connection_count": len(group_connections),
+            "bounds": bounds,
+            "sort_x": bounds["x"],
+            "sort_y": bounds["y"],
+        })
+
+    groups.sort(key=lambda item: (item["sort_x"], item["sort_y"]))
+    output_ids = {str(node.get("id") or "") for node in nodes if node.get("type") == "output"}
+    image_node_ids = {str(node.get("id") or "") for node in nodes if node.get("type") == "image"}
+    result = []
+    for index, item in enumerate(groups, start=1):
+        workflow_id = f"workflow_{index}"
+        group_nodes = [node_by_id[node_id] for node_id in item["node_ids"] if node_id in node_by_id]
+        anchor_node_id = automation_workflow_anchor_node_id(group_nodes)
+        workflow_key = automation_workflow_key_for_anchor_node(anchor_node_id)
+        legacy_workflow_key = automation_workflow_key_for_node_ids(item["node_ids"])
+        default_name = f"工作流 {index}"
+        name_entry, matched_name_key = automation_workflow_name_entry_for_detected(workflow_names, {
+            **item,
+            "workflow_key": workflow_key,
+            "legacy_workflow_key": legacy_workflow_key,
+            "anchor_node_id": anchor_node_id,
+        })
+        custom_name = str((name_entry or {}).get("name") or "").strip()
+        name = custom_name or default_name
+        node_id_set = set(item["node_ids"])
+        run_order = automation_compute_detected_run_order(workflow, item)
+        input_image_count = len(image_node_ids.intersection(node_id_set))
+        output_node_count = len(output_ids.intersection(node_id_set))
+        result.append({
+            "workflow_id": workflow_id,
+            "id": workflow_id,
+            "workflow_key": workflow_key,
+            "legacy_workflow_key": legacy_workflow_key,
+            "matched_name_key": matched_name_key,
+            "anchor_node_id": anchor_node_id,
+            "name": name,
+            "custom_name": custom_name,
+            "label": automation_named_workflow_label(name, default_name, item["node_count"], item["connection_count"]),
+            "node_ids": item["node_ids"],
+            "runnable_ids": item["runnable_ids"],
+            "connection_ids": item["connection_ids"],
+            "node_count": item["node_count"],
+            "connection_count": item["connection_count"],
+            "bounds": item["bounds"],
+            "run_order": run_order,
+            "input_image_count": input_image_count,
+            "output_node_count": output_node_count,
+        })
+    return result
+
+def automation_find_canvas_workflow(detected, canvas_workflow_id="", canvas_workflow_name=""):
+    workflow_id = str(canvas_workflow_id or "").strip()
+    workflow_name = str(canvas_workflow_name or "").strip()
+    if workflow_id:
+        match = next((
+            item for item in detected
+            if workflow_id in {
+                str(item.get("workflow_id") or ""),
+                str(item.get("workflow_key") or ""),
+                str(item.get("legacy_workflow_key") or ""),
+                str(item.get("matched_name_key") or ""),
+            }
+        ), None)
+        if not match:
+            raise HTTPException(status_code=404, detail=f"画布子工作流不存在：{workflow_id}")
+        return match
+    if workflow_name:
+        matches = [item for item in detected if str(item.get("custom_name") or item.get("name") or "").strip() == workflow_name]
+        if not matches:
+            raise HTTPException(status_code=404, detail=f"画布子工作流名称不存在：{workflow_name}")
+        if len(matches) > 1:
+            raise HTTPException(status_code=409, detail=f"画布子工作流名称重复：{workflow_name}")
+        return matches[0]
+    return None
+
+def automation_find_detected_workflow_by_key(detected, workflow_key, workflow_names=None):
+    key = str(workflow_key or "").strip()
+    if not key:
+        return None
+    for item in detected or []:
+        if key in {
+            str(item.get("workflow_key") or ""),
+            str(item.get("legacy_workflow_key") or ""),
+            str(item.get("matched_name_key") or ""),
+        }:
+            return item
+    entry = (workflow_names or {}).get(key)
+    entry_name = str((entry or {}).get("name") or "").strip()
+    entry_node_ids = set(str(node_id or "") for node_id in ((entry or {}).get("node_ids") or []) if str(node_id or ""))
+    if entry_node_ids:
+        matches = []
+        for item in detected or []:
+            item_node_ids = set(str(node_id or "") for node_id in (item.get("node_ids") or []) if str(node_id or ""))
+            if not item_node_ids:
+                continue
+            overlap = len(entry_node_ids.intersection(item_node_ids))
+            if overlap / max(len(entry_node_ids), len(item_node_ids)) >= 0.6:
+                matches.append((overlap, item))
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            matches.sort(key=lambda pair: pair[0], reverse=True)
+            if matches[0][0] > matches[1][0]:
+                return matches[0][1]
+    if entry_name:
+        matches = [
+            item for item in detected or []
+            if str(item.get("custom_name") or "").strip().casefold() == entry_name.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+def automation_canvas_subworkflow_payload(workflow, canvas_workflow_id="", canvas_workflow_name=""):
+    detected = automation_detect_canvas_workflows(workflow)
+    match = automation_find_canvas_workflow(detected, canvas_workflow_id, canvas_workflow_name)
+    if not match:
+        return workflow
+    node_ids = set(match.get("node_ids") or [])
+    nodes = [copy.deepcopy(node) for node in (workflow.get("nodes") or []) if str(node.get("id") or "") in node_ids]
+    connections = [
+        copy.deepcopy(conn)
+        for conn in (workflow.get("connections") or [])
+        if isinstance(conn, dict)
+        and str(conn.get("from") or "") in node_ids
+        and str(conn.get("to") or "") in node_ids
+    ]
+    return {
+        "format": "infinite-canvas-workflow",
+        "nodes": nodes,
+        "connections": connections,
+        "canvas_workflow_id": match.get("workflow_id") or "",
+        "canvas_workflow_key": match.get("workflow_key") or "",
+        "canvas_legacy_workflow_key": match.get("legacy_workflow_key") or "",
+        "canvas_workflow_name": match.get("custom_name") or "",
+    }
+
+def automation_upstream_image_node_ids(workflow):
+    nodes = workflow.get("nodes") or []
+    node_by_id = automation_node_map(workflow)
+    candidate_ids = []
+    for node in nodes:
+        if node.get("type") != "group":
+            continue
+        downstream_ids = automation_output_connection_ids(workflow, str(node.get("id") or ""))
+        if not any((node_by_id.get(target) or {}).get("type") in AUTOMATION_RUN_TYPES for target in downstream_ids):
+            continue
+        for item_id in node.get("items") or []:
+            item = node_by_id.get(str(item_id))
+            if item and item.get("type") == "image" and item.get("id") not in candidate_ids:
+                candidate_ids.append(item.get("id"))
+    for node in nodes:
+        if node.get("type") == "image" and node.get("id") not in candidate_ids:
+            candidate_ids.append(node.get("id"))
+    return [str(item_id) for item_id in candidate_ids if item_id]
+
+def automation_image_name_from_url(url):
+    clean = str(url or "").split("?", 1)[0].rstrip("/")
+    name = urllib.parse.unquote(os.path.basename(clean))
+    return name or "automation-input.png"
+
+def automation_is_internal_asset_url(url):
+    value = str(url or "").strip()
+    return value.startswith("/assets/input/") or value.startswith("/assets/output/") or value.startswith("/output/")
+
+def automation_decoded_internal_asset_path(url):
+    path = urllib.parse.urlsplit(str(url or "").strip()).path
+    for _ in range(5):
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    return path.replace("\\", "/")
+
+def automation_image_extension_from_source(name="", content_type=""):
+    mime = str(content_type or "").split(";", 1)[0].strip().lower()
+    ext = (os.path.splitext(str(name or ""))[1] or mimetypes.guess_extension(mime or "") or "").lower()
+    if ext == ".jpe":
+        ext = ".jpg"
+    return ext
+
+def automation_validate_image_metadata(name="", content_type=""):
+    mime = str(content_type or "").split(";", 1)[0].strip().lower()
+    ext = automation_image_extension_from_source(name, mime)
+    if ext not in LOCAL_IMAGE_IMPORT_EXTS or not mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="仅支持 PNG、JPG、JPEG、WEBP、GIF 图片")
+    return ext, mime
+
+def automation_verify_image_bytes(content):
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+    except Exception:
+        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
+
+def automation_validate_image_bytes(content, name="", content_type=""):
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    if len(content) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+    ext, _mime = automation_validate_image_metadata(name, content_type)
+    automation_verify_image_bytes(content)
+    return ext
+
+def automation_validate_image_file(path):
+    if not content_type_for_path(path).startswith("image/"):
+        raise HTTPException(status_code=400, detail="内部资源不是图片")
+    try:
+        if os.path.getsize(path) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+        with Image.open(path) as img:
+            img.verify()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
+
+async def automation_read_upload_image_content(file):
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def automation_internal_asset_path_parts(url):
+    decoded_path = automation_decoded_internal_asset_path(url)
+    mappings = (
+        ("/assets/input/", OUTPUT_INPUT_DIR),
+        ("/assets/output/", OUTPUT_OUTPUT_DIR),
+        ("/output/", OUTPUT_DIR),
+    )
+    for prefix, root in mappings:
+        if decoded_path.startswith(prefix):
+            return decoded_path, prefix, root
+    raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{url}")
+
+def automation_internal_asset_file_path(url):
+    value = str(url or "").strip()
+    decoded_path, prefix, root = automation_internal_asset_path_parts(value)
+    segments = decoded_path.replace("\\", "/").split("/")
+    if ".." in segments:
+        raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
+    rel = decoded_path[len(prefix):].lstrip("/")
+    root_abs = os.path.abspath(root)
+    target = os.path.abspath(os.path.join(root_abs, rel))
+    if os.path.commonpath([root_abs, target]) != root_abs:
+        raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=400, detail=f"内部资源图片不存在：{value}")
+    if not content_type_for_path(target).startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"内部资源不是图片：{value}")
+    automation_validate_image_file(target)
+    return target
+
+def automation_validate_internal_asset_url(url):
+    value = str(url or "").strip()
+    if not automation_is_internal_asset_url(value):
+        raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{value}")
+    automation_internal_asset_file_path(value)
+    return value
+
+def automation_apply_input_images(workflow, image_urls):
+    prepared = copy.deepcopy(workflow or {})
+    node_by_id = automation_node_map(prepared)
+    target_ids = automation_upstream_image_node_ids(prepared)
+    for node_id, image_url in zip(target_ids, image_urls or []):
+        node = node_by_id.get(node_id)
+        if not node:
+            continue
+        node["url"] = str(image_url or "")
+        node["mediaKind"] = "image"
+        node["name"] = automation_image_name_from_url(image_url)
+    return prepared
+
+def automation_compute_run_order(workflow, target_id):
+    node_by_id = automation_node_map(workflow or {})
+    connections = workflow.get("connections") or []
+    visited = set()
+    order = []
+
+    def visit(node_id):
+        node_id = str(node_id or "")
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        node = node_by_id.get(node_id)
+        if not node:
+            return
+        for conn in connections:
+            if str(conn.get("to") or "") != node_id:
+                continue
+            source_id = str(conn.get("from") or "")
+            source = node_by_id.get(source_id)
+            if not source:
+                continue
+            if source.get("type") in AUTOMATION_RUN_TYPES:
+                visit(source_id)
+            elif source.get("type") == "output":
+                for upstream in connections:
+                    if str(upstream.get("to") or "") == source_id:
+                        upstream_source = node_by_id.get(str(upstream.get("from") or ""))
+                        if upstream_source and upstream_source.get("type") in AUTOMATION_RUN_TYPES:
+                            visit(str(upstream.get("from") or ""))
+        if node.get("type") in AUTOMATION_RUN_TYPES:
+            order.append(node_id)
+
+    visit(target_id)
+    return order
+
+AUTOMATION_WORKFLOW_TASKS: Dict[str, Dict[str, Any]] = {}
+AUTOMATION_WORKFLOW_LOCK = Lock()
+AUTOMATION_TEST_CALLBACKS: List[Dict[str, Any]] = []
+
+def automation_task_public(task):
+    data = dict(task or {})
+    data.pop("workflow", None)
+    return data
+
+def automation_workflow_filename(name):
+    value = str(name or "").strip()
+    if value.lower().endswith(".json"):
+        value = value[:-5]
+    if not value or not AUTOMATION_WORKFLOW_NAME_RE.match(value) or "/" in value or "\\" in value or value in {".", ".."}:
+        raise HTTPException(status_code=400, detail="自动化工作流预设名称不合法")
+    return f"{value}.json"
+
+def automation_workflow_path(name):
+    filename = automation_workflow_filename(name)
+    path = os.path.abspath(os.path.join(AUTOMATION_WORKFLOW_DIR, filename))
+    root = os.path.abspath(AUTOMATION_WORKFLOW_DIR)
+    if not path.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="自动化工作流预设名称不合法")
+    return path
+
+def automation_list_workflow_presets():
+    if not os.path.isdir(AUTOMATION_WORKFLOW_DIR):
+        return []
+    items = []
+    for filename in sorted(os.listdir(AUTOMATION_WORKFLOW_DIR)):
+        if not filename.lower().endswith(".json"):
+            continue
+        name = filename[:-5]
+        if AUTOMATION_WORKFLOW_NAME_RE.match(name):
+            items.append({"name": name, "filename": filename})
+    return items
+
+def automation_load_workflow_preset(name):
+    path = automation_workflow_path(name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"自动化工作流预设不存在：{name}")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            workflow = json.load(f)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取自动化工作流预设：{exc}") from exc
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("nodes"), list):
+        raise HTTPException(status_code=400, detail="自动化工作流预设格式不正确")
+    return workflow
+
+def automation_workflow_from_canvas(canvas_id, canvas_workflow_id="", canvas_workflow_name=""):
+    canvas = load_canvas(canvas_id)
+    nodes = canvas.get("nodes") or []
+    connections = canvas.get("connections") or []
+    if not isinstance(nodes, list) or not isinstance(connections, list):
+        raise HTTPException(status_code=400, detail="画布格式不正确，缺少 nodes/connections")
+    workflow = {
+        "format": "infinite-canvas-workflow",
+        "nodes": nodes,
+        "connections": connections,
+        "automation_workflow_names": automation_canvas_workflow_name_entries(canvas),
+    }
+    if str(canvas_workflow_id or "").strip() or str(canvas_workflow_name or "").strip():
+        return automation_canvas_subworkflow_payload(workflow, canvas_workflow_id, canvas_workflow_name)
+    return workflow
+
+def automation_workflow_source(payload):
+    if isinstance(payload.workflow, dict) and payload.workflow.get("nodes"):
+        return "inline"
+    if payload.canvas_id:
+        return "canvas"
+    if payload.workflow_name:
+        return "preset"
+    return ""
+
+def automation_resolve_workflow(payload):
+    if isinstance(payload.workflow, dict) and payload.workflow.get("nodes"):
+        return payload.workflow
+    if payload.canvas_id:
+        return automation_workflow_from_canvas(payload.canvas_id, payload.canvas_workflow_id, payload.canvas_workflow_name)
+    if payload.workflow_name:
+        return automation_load_workflow_preset(payload.workflow_name)
+    raise HTTPException(status_code=400, detail="请提供 workflow、canvas_id 或 workflow_name")
+
+def automation_canvas_records():
+    records = []
+    for item in list_canvases():
+        records.append({
+            "id": item.get("id"),
+            "title": item.get("title", "未命名画布"),
+            "kind": normalize_canvas_kind(item.get("kind")),
+            "node_count": int(item.get("node_count") or 0),
+            "updated_at": item.get("updated_at", 0),
+        })
+    return records
+
+def automation_canvas_workflow_records(canvas_id):
+    canvas = load_canvas(canvas_id)
+    nodes = canvas.get("nodes") or []
+    connections = canvas.get("connections") or []
+    if not isinstance(nodes, list) or not isinstance(connections, list):
+        raise HTTPException(status_code=400, detail="画布格式不正确，缺少 nodes/connections")
+    workflow = {
+        "format": "infinite-canvas-workflow",
+        "nodes": nodes,
+        "connections": connections,
+        "automation_workflow_names": automation_canvas_workflow_name_entries(canvas),
+    }
+    return {
+        "canvas_id": canvas.get("id") or canvas_id,
+        "title": canvas.get("title", "未命名画布"),
+        "workflows": automation_detect_canvas_workflows(workflow),
+    }
+
+def automation_update_canvas_workflow_name(canvas_id, workflow_key, name):
+    canvas = load_canvas(canvas_id)
+    nodes = canvas.get("nodes") or []
+    connections = canvas.get("connections") or []
+    if not isinstance(nodes, list) or not isinstance(connections, list):
+        raise HTTPException(status_code=400, detail="画布格式不正确，缺少 nodes/connections")
+    key = str(workflow_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="workflow_key 必填")
+    entries = automation_canvas_workflow_name_entries(canvas)
+    workflow = {
+        "format": "infinite-canvas-workflow",
+        "nodes": nodes,
+        "connections": connections,
+        "automation_workflow_names": entries,
+    }
+    detected = automation_detect_canvas_workflows(workflow)
+    match = automation_find_detected_workflow_by_key(detected, key, entries)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"画布子工作流不存在：{key}")
+    canonical_key = str(match.get("workflow_key") or key)
+    old_keys = {
+        key,
+        str(match.get("legacy_workflow_key") or ""),
+        str(match.get("matched_name_key") or ""),
+    }
+    old_keys.discard(canonical_key)
+    old_keys.discard("")
+    clean_name = str(name or "").strip()[:80]
+    if clean_name:
+        duplicate = next(
+            (
+                item for item in detected
+                if item.get("workflow_key") != canonical_key
+                and str(item.get("name") or "").strip().casefold() == clean_name.casefold()
+            ),
+            None,
+        )
+        if duplicate:
+            raise HTTPException(status_code=409, detail=f"画布子工作流名称已存在：{clean_name}")
+        entries[canonical_key] = {
+            "name": clean_name,
+            "updated_at": now_ms(),
+            "legacy_workflow_key": str(match.get("legacy_workflow_key") or ""),
+            "anchor_node_id": str(match.get("anchor_node_id") or ""),
+            "node_ids": [str(node_id or "") for node_id in (match.get("node_ids") or []) if str(node_id or "")],
+        }
+        for old_key in old_keys:
+            entries.pop(old_key, None)
+    else:
+        entries.pop(canonical_key, None)
+        for old_key in old_keys:
+            entries.pop(old_key, None)
+    canvas["automation_workflow_names"] = entries
+    save_canvas(canvas)
+    refreshed = automation_canvas_workflow_records(canvas_id)
+    workflow_record = next((item for item in refreshed.get("workflows") or [] if item.get("workflow_key") == canonical_key), None)
+    return {
+        "workflow": workflow_record,
+        "workflows": refreshed.get("workflows") or [],
+        "updated_at": canvas.get("updated_at", 0),
+    }
+
+def automation_media_kind_for_node(node):
+    kind = str((node or {}).get("mediaKind") or (node or {}).get("kind") or "image").lower()
+    return kind if kind in {"image", "video", "audio"} else "image"
+
+async def automation_prepare_input_images(image_urls):
+    prepared = []
+    os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
+    timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        for index, image_url in enumerate(image_urls or []):
+            url = str(image_url or "").strip()
+            if automation_is_internal_asset_url(url):
+                prepared.append(automation_validate_internal_asset_url(url))
+                continue
+            if not url.startswith(("http://", "https://")):
+                raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{url}")
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                ext, _mime = automation_validate_image_metadata(urllib.parse.urlparse(url).path, content_type)
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+                            raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+                    except HTTPException:
+                        raise
+                    except ValueError:
+                        raise HTTPException(status_code=400, detail="远程图片响应不合法")
+                chunks = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+                    chunks.append(chunk)
+            content = b"".join(chunks)
+            automation_validate_image_bytes(content, urllib.parse.urlparse(url).path, content_type)
+            filename = f"automation_{int(time.time())}_{uuid.uuid4().hex[:8]}_{index}{ext}"
+            target = os.path.join(OUTPUT_INPUT_DIR, filename)
+            with open(target, "wb") as f:
+                f.write(content)
+            prepared.append(f"/assets/input/{filename}")
+    return prepared
+
+async def automation_download_input_images(image_urls):
+    return await automation_prepare_input_images(image_urls)
+
+def automation_connected_source_nodes(workflow, target_id):
+    node_by_id = automation_node_map(workflow)
+    return [
+        (conn, node_by_id.get(str(conn.get("from") or "")))
+        for conn in workflow.get("connections") or []
+        if str(conn.get("to") or "") == str(target_id or "")
+    ]
+
+def automation_group_image_refs(workflow, group_node):
+    node_by_id = automation_node_map(workflow)
+    refs = []
+    for item_id in (group_node or {}).get("items") or []:
+        item = node_by_id.get(str(item_id))
+        if item and item.get("type") == "image" and item.get("url") and automation_media_kind_for_node(item) == "image":
+            refs.append({
+                "url": item.get("url") or "",
+                "name": item.get("name") or automation_image_name_from_url(item.get("url")),
+                "role": item.get("role") or "",
+                "kind": "image",
+            })
+    return refs
+
+def automation_llm_input_images(workflow, node):
+    refs = []
+    for _conn, source in automation_connected_source_nodes(workflow, node.get("id")):
+        if not source:
+            continue
+        if source.get("type") == "image" and source.get("url") and automation_media_kind_for_node(source) == "image":
+            refs.append(source.get("url"))
+        elif source.get("type") == "group":
+            refs.extend(ref["url"] for ref in automation_group_image_refs(workflow, source) if ref.get("url"))
+        elif source.get("type") == "output":
+            images = source.get("images") or []
+            for item in reversed(images):
+                url = outputUrlValue(item) if "outputUrlValue" in globals() else (item if isinstance(item, str) else item.get("url"))
+                if url:
+                    refs.append(url)
+                    break
+    return refs
+
+def automation_llm_input_text(workflow, node):
+    parts = []
+    for conn, source in automation_connected_source_nodes(workflow, node.get("id")):
+        if not source:
+            continue
+        if source.get("type") == "prompt":
+            parts.append(source.get("text") or "")
+        elif source.get("type") == "llm":
+            parts.append(source.get("outputText") or "")
+        elif source.get("type") in {"json-splitter", "json-extractor"} and isinstance(source.get("sourceItems"), list):
+            port_index = int(conn.get("fromPort") or 0)
+            parts.append(source["sourceItems"][port_index] if port_index < len(source["sourceItems"]) else source["sourceItems"][0])
+    text = "\n\n".join(part for part in parts if part)
+    return text or str(node.get("userInput") or "")
+
+async def automation_call_llm_node(workflow, node):
+    message = automation_llm_input_text(workflow, node)
+    if not message:
+        raise HTTPException(status_code=400, detail=f"LLM 节点缺少输入：{node.get('id')}")
+    result = await canvas_llm(CanvasLLMRequest(
+        message=message,
+        model=str(node.get("model") or node.get("llmMsModel") or ""),
+        ms_model=str(node.get("model") or node.get("llmMsModel") or "") if str(node.get("llmProvider") or "") == "modelscope" else "",
+        provider=str(node.get("llmProvider") or "comfly"),
+        system_prompt=str(node.get("systemPrompt") or "You are a helpful assistant."),
+        messages=node.get("messages") or [],
+        images=automation_llm_input_images(workflow, node),
+        videos=[],
+        output_format=str(node.get("outputFormat") or "text"),
+    ))
+    return str(result.get("text") or "")
+
+def automation_json_splitter_input_text(workflow, node):
+    sources = automation_connected_source_nodes(workflow, node.get("id"))
+    if not sources:
+        raise HTTPException(status_code=400, detail=f"JSON 拆分节点未连接源节点：{node.get('id')}")
+    conn, source = sources[0]
+    if not source:
+        raise HTTPException(status_code=400, detail=f"JSON 拆分节点源不存在：{node.get('id')}")
+    if source.get("type") in {"json-splitter", "json-extractor"} and isinstance(source.get("sourceItems"), list):
+        port_index = int(conn.get("fromPort") or 0)
+        return source["sourceItems"][port_index] if port_index < len(source["sourceItems"]) else source["sourceItems"][0]
+    return str(source.get("outputText") or "")
+
+def automation_run_json_splitter_node(workflow, node):
+    source_text = automation_json_splitter_input_text(workflow, node)
+    if not source_text:
+        raise HTTPException(status_code=400, detail=f"JSON 拆分节点源没有输出：{node.get('id')}")
+    node["sourceText"] = source_text
+    # 记录自动识别命中的 key（供前端调试展示，不参与拆分逻辑）
+    try:
+        parsed = json.loads(str(source_text or ""))
+    except Exception:
+        parsed = None
+    container = automation_find_prompt_array(parsed) if isinstance(parsed, (dict, list)) else None
+    node["selectedSourceKey"] = (container or {}).get("key", "")
+    node["sourceItems"] = automation_parse_json_prompt_items(source_text)
+    node["outputPorts"] = len(node["sourceItems"])
+    return node["sourceItems"]
+
+def automation_generator_sources(workflow, node):
+    refs = []
+    prompts = []
+    for conn, source in automation_connected_source_nodes(workflow, node.get("id")):
+        if not source:
+            continue
+        source_type = source.get("type")
+        if source_type == "image" and source.get("url"):
+            refs.append({
+                "url": source.get("url") or "",
+                "name": source.get("name") or automation_image_name_from_url(source.get("url")),
+                "role": source.get("role") or "",
+                "kind": automation_media_kind_for_node(source),
+            })
+        elif source_type == "group":
+            refs.extend(automation_group_image_refs(workflow, source))
+        elif source_type == "prompt" and source.get("text"):
+            prompts.append(str(source.get("text") or ""))
+        elif source_type == "llm" and source.get("outputText"):
+            prompts.append(str(source.get("outputText") or ""))
+        elif source_type in {"json-splitter", "json-extractor"} and isinstance(source.get("sourceItems"), list):
+            port_index = int(conn.get("fromPort") or 0)
+            item = source["sourceItems"][port_index] if port_index < len(source["sourceItems"]) else source["sourceItems"][0]
+            prompts.append(str(item or ""))
+    return prompts, refs
+
+def automation_generator_size(node):
+    custom = str(node.get("customSize") or "").strip()
+    if custom:
+        return custom
+    width = str(node.get("customWidth") or node.get("customRatioWidth") or "").strip()
+    height = str(node.get("customHeight") or node.get("customRatioHeight") or "").strip()
+    if width.isdigit() and height.isdigit():
+        return f"{width}x{height}"
+    resolution = str(node.get("resolution") or "1k").lower()
+    base = 1024
+    if resolution == "2k":
+        base = 2048
+    elif resolution == "4k":
+        base = 4096
+    ratio = str(node.get("ratio") or "square").lower()
+    if ratio in {"square", "1:1"}:
+        return f"{base}x{base}"
+    return f"{base}x{base}"
+
+def automation_build_generator_request(workflow, node):
+    prompts, refs = automation_generator_sources(workflow, node)
+    prompt = "\n\n".join(item for item in prompts if item).strip() or "Edit the reference images."
+    return OnlineImageRequest(
+        prompt=prompt,
+        provider_id=str(node.get("apiProvider") or "comfly"),
+        model=str(node.get("model") or ""),
+        size=automation_generator_size(node),
+        quality=str(node.get("quality") or "auto"),
+        n=max(1, min(8, int(node.get("count") or 1))),
+        reference_images=[AIReference(**ref) for ref in refs if ref.get("url")],
+    )
+
+def automation_terminal_generator_ids(workflow):
+    node_by_id = automation_node_map(workflow)
+    output_ids = {str(node.get("id") or "") for node in workflow.get("nodes") or [] if node.get("type") == "output"}
+    ids = []
+    for conn in workflow.get("connections") or []:
+        if str(conn.get("to") or "") in output_ids:
+            source_id = str(conn.get("from") or "")
+            source = node_by_id.get(source_id)
+            if source and source.get("type") == "generator" and source_id not in ids:
+                ids.append(source_id)
+    if ids:
+        return ids
+    return [str(node.get("id") or "") for node in workflow.get("nodes") or [] if node.get("type") == "generator"]
+
+async def automation_post_callback(callback_url, payload):
+    if not callback_url:
+        return
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0), follow_redirects=True) as client:
+        response = await client.post(callback_url, json=payload)
+        response.raise_for_status()
+
 class SmartCanvasGroupExportItem(BaseModel):
     kind: str = ""
     url: str = ""
@@ -3533,6 +4768,67 @@ def text_from_chat_response(data):
                 parts.append(item.get("text") or item.get("content") or "")
         return "\n".join(part for part in parts if part)
     return str(content)
+
+# 推理型模型（Qwen3 / DeepSeek R1 / MiniMax-M3 等）会在最终答案前注入
+# <think>...</think> 思考过程；剥离它才能拿到真正的 JSON / 文本。
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# 兜底：模型有时把 JSON 塞在 markdown ```json ... ``` 代码块里
+FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", re.IGNORECASE)
+# 兜底：抓取文本中第一个完整的 {...} 或 [...] 块
+FIRST_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.DOTALL)
+FIRST_JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]", re.DOTALL)
+
+def strip_think_blocks(text: str) -> str:
+    """从模型输出中移除 <think>...</think> 推理块，便于 JSON 解析或正文提取。"""
+    if not text:
+        return text
+    cleaned = THINK_BLOCK_RE.sub("", text)
+    # 处理 <think> 未闭合的极端情况：截到 <think> 之前
+    if "<think>" in cleaned.lower() and "</think>" not in cleaned.lower():
+        idx = cleaned.lower().find("<think>")
+        cleaned = cleaned[:idx]
+    return cleaned.strip()
+
+def extract_chat_text(raw, *, strip_think: bool = True) -> str:
+    """从 LLM 响应原始 dict 抽取文本，统一剥离 think 块 + 空文本兜底。
+
+    替代 4 个端点（/api/canvas-llm, /api/chat, /api/chat/agent, image caption）里重复的
+    `text_from_chat_response(raw).strip() or "接口返回了空回复。"` 模式。
+    """
+    if not isinstance(raw, dict):
+        return "接口返回了空回复。"
+    text = text_from_chat_response(raw).strip()
+    if strip_think:
+        text = strip_think_blocks(text)
+    return text or "接口返回了空回复。"
+
+def extract_json_object(text: str):
+    """多策略从 LLM 输出中抽取 JSON 对象。返回 dict/list 或 None。
+
+    顺序：① 直接 json.loads；② 剥离 think 块再 load；③ 抓 markdown 代码块里的 JSON；
+    ④ 抓文本里第一个 {...} 块。
+    """
+    if not text:
+        return None
+    candidates = [text]
+    stripped = strip_think_blocks(text)
+    if stripped and stripped != text:
+        candidates.append(stripped)
+    for fenced in FENCED_JSON_RE.findall(text):
+        if fenced and fenced not in candidates:
+            candidates.append(fenced)
+    for obj_match in FIRST_JSON_OBJECT_RE.findall(text):
+        if obj_match and obj_match not in candidates:
+            candidates.append(obj_match)
+    for arr_match in FIRST_JSON_ARRAY_RE.findall(text):
+        if arr_match and arr_match not in candidates:
+            candidates.append(arr_match)
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
+    return None
 
 def text_delta_from_chat_chunk(data):
     choices = data.get("choices") or []
@@ -8898,7 +10194,7 @@ def heuristic_agent_decision(message, refs, has_previous_image):
     return {"action": "chat", "prompt": message, "reply": ""}
 
 def parse_agent_decision(raw_text, message, refs, has_previous_image):
-    text = str(raw_text or "").strip()
+    text = strip_think_blocks(str(raw_text or "")).strip()
     data = None
     if text:
         match = re.search(r"\{[\s\S]*\}", text)
@@ -8965,10 +10261,16 @@ async def decide_chat_agent_action(payload, conversation, refs):
             decision = parse_agent_decision(text_from_chat_response(raw), payload.message, refs, has_previous_image)
             decision["router_model"] = model
             return decision
+    except httpx.HTTPError as exc:
+        # 之前是 except Exception 静默 return fallback，掩盖 API key 失效、provider 限流、网络中断。
+        # 现在显式抛 502，让客户端能区分"AI 决策了不想要的结果" vs "AI 根本没工作"。
+        log_net_error(f"[chat-agent] intent router 网络/TLS错误 provider={payload.provider} model={model}", exc)
+        raise HTTPException(status_code=502, detail=f"意图路由调用 LLM 失败：{exc}") from exc
+    except HTTPException:
+        raise
     except Exception as exc:
-        print(f"[chat-agent] intent router fallback: {exc}")
-        fallback["router_model"] = model
-        return fallback
+        log_net_error(f"[chat-agent] intent router 内部错误 provider={payload.provider} model={model}", exc)
+        raise HTTPException(status_code=500, detail=f"意图路由内部错误：{exc}") from exc
 
 async def build_chat_text_reply(payload, conversation):
     chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
@@ -8997,7 +10299,7 @@ async def build_chat_text_reply(payload, conversation):
     return {
         "id": uuid.uuid4().hex,
         "role": "assistant",
-        "content": text_from_chat_response(raw).strip() or "接口返回了空回复。",
+        "content": extract_chat_text(raw),
         "created_at": now_ms(),
         "model": model,
         "raw_usage": raw_data.get("usage") if isinstance(raw_data, dict) else None,
@@ -11237,6 +12539,162 @@ async def get_canvas_comfy_task(task_id: str):
         raise HTTPException(status_code=404, detail="ComfyUI 任务不存在，可能服务已重启或任务已过期")
     return task
 
+async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflowRunRequest):
+    with AUTOMATION_WORKFLOW_LOCK:
+        task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+        if task:
+            task["status"] = "running"
+            task["updated_at"] = time.time()
+    try:
+        local_images = await automation_download_input_images(payload.image_urls)
+        with AUTOMATION_WORKFLOW_LOCK:
+            task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+            queued_workflow = task.get("workflow") if isinstance(task, dict) else None
+        if isinstance(queued_workflow, dict) and queued_workflow.get("nodes"):
+            workflow_source = queued_workflow
+        else:
+            workflow_source = automation_resolve_workflow(payload)
+        workflow = automation_apply_input_images(workflow_source, local_images)
+        node_by_id = automation_node_map(workflow)
+        target_ids = automation_terminal_generator_ids(workflow)
+        if not target_ids:
+            raise HTTPException(status_code=400, detail="工作流中没有可执行的图片生成节点")
+        run_order = []
+        for target_id in target_ids:
+            for node_id in automation_compute_run_order(workflow, target_id):
+                if node_id not in run_order:
+                    run_order.append(node_id)
+        output_images = []
+        for node_id in run_order:
+            node = node_by_id.get(node_id)
+            if not node:
+                continue
+            node_type = node.get("type")
+            if node_type == "llm":
+                node["outputText"] = await automation_call_llm_node(workflow, node)
+            elif node_type in {"json-splitter", "json-extractor"}:
+                automation_run_json_splitter_node(workflow, node)
+            elif node_type == "generator":
+                result = await build_online_image_result(automation_build_generator_request(workflow, node))
+                images = [url for url in result.get("images") or [] if url]
+                node["generatedOutputs"] = images
+                output_images.extend(images)
+        if not output_images:
+            raise HTTPException(status_code=502, detail="自动化工作流完成但没有生成图片")
+        with AUTOMATION_WORKFLOW_LOCK:
+            task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+            if task:
+                task["status"] = "succeeded"
+                task["images"] = output_images
+                task["error"] = ""
+                task["workflow"] = workflow
+                task["updated_at"] = time.time()
+                callback_payload = automation_task_public(task)
+            else:
+                callback_payload = {"task_id": task_id, "status": "succeeded", "images": output_images, "error": ""}
+        if payload.callback_url:
+            try:
+                await automation_post_callback(payload.callback_url, callback_payload)
+            except Exception as callback_exc:
+                with AUTOMATION_WORKFLOW_LOCK:
+                    task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+                    if task:
+                        task["callback_error"] = str(getattr(callback_exc, "detail", None) or callback_exc)
+                        task["updated_at"] = time.time()
+    except Exception as exc:
+        callback_payload = None
+        with AUTOMATION_WORKFLOW_LOCK:
+            task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+            if task:
+                task["status"] = "failed"
+                task["error"] = str(getattr(exc, "detail", None) or exc)
+                task["updated_at"] = time.time()
+                callback_payload = automation_task_public(task)
+        if payload.callback_url and callback_payload:
+            try:
+                await automation_post_callback(payload.callback_url, callback_payload)
+            except Exception as callback_exc:
+                with AUTOMATION_WORKFLOW_LOCK:
+                    task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+                    if task:
+                        task["callback_error"] = str(getattr(callback_exc, "detail", None) or callback_exc)
+                        task["updated_at"] = time.time()
+
+@app.post("/api/automation/workflow-runs")
+async def create_automation_workflow_run(payload: AutomationWorkflowRunRequest):
+    workflow = automation_resolve_workflow(payload)
+    workflow_source = automation_workflow_source(payload)
+    task_id = f"auto_{uuid.uuid4().hex}"
+    now = time.time()
+    with AUTOMATION_WORKFLOW_LOCK:
+        AUTOMATION_WORKFLOW_TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "images": [],
+            "error": "",
+            "callback_url": payload.callback_url,
+            "callback_error": "",
+            "workflow_name": payload.workflow_name,
+            "canvas_id": payload.canvas_id,
+            "canvas_workflow_id": workflow.get("canvas_workflow_id") or payload.canvas_workflow_id,
+            "canvas_workflow_name": workflow.get("canvas_workflow_name") or payload.canvas_workflow_name,
+            "workflow_source": workflow_source,
+            "created_at": now,
+            "updated_at": now,
+            "workflow": workflow,
+        }
+    asyncio.create_task(run_automation_workflow_task(task_id, payload))
+    return {"task_id": task_id, "status": "queued"}
+
+@app.post("/api/automation/upload")
+async def upload_automation_input(file: UploadFile = File(...)):
+    original_name = file.filename or "automation-input.png"
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    automation_validate_image_metadata(original_name, content_type)
+    content = await automation_read_upload_image_content(file)
+    ext = automation_validate_image_bytes(content, original_name, content_type)
+    filename = f"automation_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+    os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
+    target = os.path.join(OUTPUT_INPUT_DIR, filename)
+    with open(target, "wb") as f:
+        f.write(content)
+    return {
+        "url": f"/assets/input/{filename}",
+        "name": original_name,
+        "size": len(content),
+    }
+
+@app.get("/api/automation/workflows")
+async def list_automation_workflows():
+    return {"workflows": automation_list_workflow_presets()}
+
+@app.get("/api/automation/canvases")
+async def list_automation_canvases():
+    return {"canvases": automation_canvas_records()}
+
+@app.get("/api/automation/canvases/{canvas_id}/workflows")
+async def list_automation_canvas_workflows(canvas_id: str):
+    return automation_canvas_workflow_records(canvas_id)
+
+@app.patch("/api/automation/canvases/{canvas_id}/workflows/{workflow_key}/name")
+async def rename_automation_canvas_workflow(canvas_id: str, workflow_key: str, payload: AutomationCanvasWorkflowNameUpdate):
+    return automation_update_canvas_workflow_name(canvas_id, workflow_key, payload.name)
+
+@app.get("/api/automation/workflow-runs/{task_id}")
+async def get_automation_workflow_run(task_id: str):
+    with AUTOMATION_WORKFLOW_LOCK:
+        task = automation_task_public(AUTOMATION_WORKFLOW_TASKS.get(task_id))
+    if not task:
+        raise HTTPException(status_code=404, detail="自动化任务不存在，可能服务已重启或任务已过期")
+    return task
+
+@app.post("/api/automation/test-callback")
+async def automation_test_callback(payload: Dict[str, Any]):
+    item = dict(payload or {})
+    item["received_at"] = time.time()
+    AUTOMATION_TEST_CALLBACKS.append(item)
+    return {"ok": True, "count": len(AUTOMATION_TEST_CALLBACKS)}
+
 # --- 图像生成参数 schema（供客户端动态渲染参数表单，避免把参数写死在前端） ---
 IMAGE_PARAM_RATIOS = [
     {"value": "1:1", "label": "1:1"},
@@ -12278,21 +13736,38 @@ async def canvas_llm(payload: CanvasLLMRequest):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"解析上游响应失败：{exc}") from exc
     try:
-        text = text_from_chat_response(raw).strip() if isinstance(raw, dict) else ""
-        text = text or "接口返回了空回复。"
+        text = extract_chat_text(raw)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"解析回复内容失败：{exc}") from exc
+    # 提取 finish_reason（识别上游是否因 max_tokens 截断）
+    finish_reason = ""
+    if isinstance(raw, dict):
+        _choices = raw.get("choices") or []
+        if _choices and isinstance(_choices[0], dict):
+            finish_reason = str(_choices[0].get("finish_reason") or "")
     # JSON 模式：必须返回合法 JSON，否则 422 错误
     parsed_json = None
     if payload.output_format == "json":
-        try:
-            parsed_json = json.loads(text)
-        except Exception as exc:
+        # 推理型模型会先输出 <think>...</think> 思考过程 + 可能嵌套 markdown 代码块，
+        # 用多策略 extract_json_object 兜底
+        parsed_json = extract_json_object(text)
+        if parsed_json is None:
             preview = text[:200].replace("\n", " ")
+            if finish_reason == "length":
+                # 真正根因：上游 LLM 响应被 max_tokens 截断，JSON 因此不完整
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"LLM 响应被 max_tokens 截断（当前 {LLM_MAX_TOKENS}），"
+                        f"导致 JSON 不完整。提示词生成的 JSON 超过 {LLM_MAX_TOKENS} tokens。"
+                        f"请在 .env 设置 LLM_MAX_TOKENS=16384 或更高后重启服务。"
+                        f"前 200 字符：{preview}"
+                    )
+                )
             raise HTTPException(
                 status_code=422,
-                detail=f"LLM 未返回合法 JSON（{type(exc).__name__}: {exc}）。前 200 字符：{preview}"
-            ) from exc
+                detail=f"LLM 未返回合法 JSON。前 200 字符：{preview}"
+            )
     raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else {}
     return {"text": text, "json": parsed_json, "model": model, "raw_usage": raw_data.get("usage")}
 
@@ -13233,8 +14708,7 @@ async def caption_image_with_provider(abs_path, prompt, provider_id, model, ms_m
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"解析上游响应失败：{exc}") from exc
-    text = text_from_chat_response(raw).strip() if isinstance(raw, dict) else ""
-    return text or "接口返回了空回复。", resolved_model
+    return extract_chat_text(raw), resolved_model
 
 @app.patch("/api/asset-library/items/{item_id}")
 async def rename_asset_library_item(item_id: str, payload: AssetLibraryRenameRequest):
@@ -13643,7 +15117,7 @@ async def chat(payload: ChatRequest, request: Request, x_user_id: str = Header(d
         assistant_message = {
             "id": uuid.uuid4().hex,
             "role": "assistant",
-            "content": text_from_chat_response(raw).strip() or "接口返回了空回复。",
+            "content": extract_chat_text(raw),
             "created_at": now_ms(),
             "model": model,
             "raw_usage": raw_data.get("usage") if isinstance(raw_data, dict) else None,
@@ -13938,7 +15412,7 @@ async def poll_angle_cloud(req: CloudPollRequest):
                     img_url = data["output_images"][0]
                     local_path = ""
                     try:
-                        async with httpx.AsyncClient() as dl_client:
+                        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as dl_client:
                             img_res = await dl_client.get(img_url)
                             if img_res.status_code == 200:
                                 filename = f"cloud_angle_{int(time.time())}.png"
@@ -14028,7 +15502,7 @@ async def generate_angle_cloud(req: CloudGenRequest):
                     img_url = data["output_images"][0]
                     local_path = ""
                     try:
-                        async with httpx.AsyncClient() as dl_client:
+                        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as dl_client:
                             img_res = await dl_client.get(img_url)
                             if img_res.status_code == 200:
                                 filename = f"cloud_angle_{int(time.time())}.png"
@@ -14126,7 +15600,7 @@ async def generate_cloud(req: CloudGenRequest):
                     img_url = data["output_images"][0]
                     local_path = ""
                     try:
-                        async with httpx.AsyncClient() as dl_client:
+                        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as dl_client:
                             img_res = await dl_client.get(img_url)
                             if img_res.status_code == 200:
                                 filename = f"cloud_{int(time.time())}.png"
@@ -14222,7 +15696,7 @@ async def ms_generate(req: MsGenerateRequest):
                         img_url = data["output_images"][0]
                         local_path = ""
                         try:
-                            async with httpx.AsyncClient() as dl_client:
+                            async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as dl_client:
                                 img_res = await dl_client.get(img_url)
                                 if img_res.status_code == 200:
                                     filename = f"ms_{req.model.replace('/', '_').replace(':', '_')}_{int(time.time())}.png"

@@ -1,0 +1,93 @@
+# ============================================
+# Infinite-Canvas .gitignore
+# 目的：保护 API 密钥、用户数据、构建产物
+# 警告：已追踪的文件不因新增此文件而被移除
+# ============================================
+
+# --- 🚨 关键：API 密钥与凭据 ---
+# API/.env 含 sk-pzwf / sk-cp-z 等明文密钥
+API/.env
+API/.env.*
+# 例外：允许提交 .env.example 模板
+!API/.env.example
+# 通用 .env 防护（任意位置）
+.env
+.env.*
+!.env.example
+# 其他凭据
+*.pem
+*.key
+*.crt
+secrets/
+credentials.json
+
+# --- 用户运行时数据（不应入库）---
+data/
+assets/
+output/
+history.json
+conversations/
+
+# --- Python 编译产物 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- 虚拟环境 ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- IDE / 编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 日志 ---
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pip-log.txt
+
+# --- OS / 临时 ---
+*.tmp
+*.bak
+*.swp
+~$*
+.tmp/
+tmp/
+temp/
+
+# --- 测试 artifacts ---
+# 不追踪 tests/ 目录（保留本地开发；外部不强制）
+tests/
+.test_*.json
+test-results/
+playwright-report/
+.coverage
+
+# --- 本地脚本（用户私有，不入库）---
+local-*.sh
+local-*.bat
+my-*.sh

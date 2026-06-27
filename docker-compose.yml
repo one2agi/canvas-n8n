@@ -12,7 +12,7 @@ services:
       - "/app/__pycache__"
       - "/app/.pytest_cache"
     environment:
-      - LLM_MAX_TOKENS=4096
+      - LLM_MAX_TOKENS=8600
       - PYTHONUNBUFFERED=1
       # ComfyUI 通过 host.docker.internal 访问宿主
       - COMFYUI_INSTANCES=host.docker.internal:8188

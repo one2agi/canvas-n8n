@@ -9,7 +9,7 @@
     <script src="/static/vendor/js/lucide.js?v=2026.06.25.1782398606"></script>
     <script src="/static/js/theme.js?v=2026.06.25.1782398606"></script>
     <script src="/static/js/i18n.js?v=2026.06.25.1782398606"></script>
-    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.06.25.1782457987">
+    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.06.25.1782558117">
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.25.1782398605">
 </head>
 <body>
@@ -44,6 +44,18 @@
                     <button id="workflowTransferToggle" class="tool-btn toolbar-workflow" type="button" title="导入导出工作流" aria-label="导入导出工作流"><i data-lucide="package-open" class="w-4 h-4"></i><span>工作流</span></button>
                     <button id="canvasAssetToggle" class="tool-btn toolbar-asset canvas-asset-toggle" type="button" title="资产库" aria-label="资产库"><i data-lucide="library" class="w-4 h-4"></i><span>资产库</span></button>
                     <button id="canvasLogToggle" class="tool-btn toolbar-log" type="button" onclick="openCanvasLog(event)" title="日志" aria-label="日志" data-i18n-title="canvas.logs"><i data-lucide="list-todo" class="w-4 h-4"></i><span data-i18n="canvas.logs">日志</span></button>
+                </div>
+            </div>
+            <div id="workflowRunBar" class="panel workflow-run-bar editor-only">
+                <div class="workflow-run-meta">
+                    <i data-lucide="workflow" class="w-4 h-4"></i>
+                    <select id="workflowRunSelect" class="workflow-run-select" aria-label="选择工作流"></select>
+                </div>
+                <div class="workflow-run-actions">
+                    <button id="workflowRunRenameBtn" class="workflow-run-btn" type="button" title="重命名工作流" aria-label="重命名工作流"><i data-lucide="pencil" class="w-4 h-4"></i><span>改名</span></button>
+                    <button id="workflowRunLocateBtn" class="workflow-run-btn" type="button" title="定位工作流"><i data-lucide="crosshair" class="w-4 h-4"></i><span>定位</span></button>
+                    <button id="workflowRunStartBtn" class="workflow-run-btn primary" type="button" title="运行工作流"><i data-lucide="play" class="w-4 h-4"></i><span>运行</span></button>
+                    <button id="workflowRunStopBtn" class="workflow-run-btn danger" type="button" title="停止运行"><i data-lucide="square" class="w-4 h-4"></i><span>停止</span></button>
                 </div>
             </div>
         </div>
@@ -314,6 +326,6 @@
     </div>
 
     <script src="/static/js/ltx-director-timeline.js?v=2026.06.25.1782398606"></script>
-    <script src="/static/js/canvas.js?v=2026.06.25.1782457959"></script>
+    <script src="/static/js/canvas.js?v=2026.06.25.1782558798"></script>
 </body>
 </html>
