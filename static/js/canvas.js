@@ -243,6 +243,11 @@ const workflowExportMeta = document.getElementById('workflowExportMeta');
 const workflowImportInput = document.getElementById('workflowImportInput');
 const workflowImportDropZone = document.getElementById('workflowImportDropZone');
 const workflowExportLibraryBtn = document.getElementById('workflowExportLibraryBtn');
+const workflowRunBar = document.getElementById('workflowRunBar');
+const workflowRunSelect = document.getElementById('workflowRunSelect');
+const workflowRunLocateBtn = document.getElementById('workflowRunLocateBtn');
+const workflowRunStartBtn = document.getElementById('workflowRunStartBtn');
+const workflowRunStopBtn = document.getElementById('workflowRunStopBtn');
 const assetManagerModal = document.getElementById('assetManagerModal');
 const assetManagerBody = document.getElementById('assetManagerBody');
 function revealCanvasAssetControls(){
@@ -374,6 +379,8 @@ let undoStack = [];
 const UNDO_MAX = 30;
 const cascadeRunningIds = new Set();
 const cascadeStopIds = new Set();
+let detectedWorkflows = [];
+let activeDetectedWorkflowId = '';
 const cascadeSerialIds = new Set(); // 记录以串行循环模式启动的运行，用于停止按钮
 const cascadeContexts = new Map();
 let cropState = null;
@@ -1100,6 +1107,7 @@ function centerViewportOnWorldPoint(point){
     applyViewport();
     renderLinks();
     renderSelectionHub();
+    renderWorkflowRunBar();
 }
 function safeViewportScale(value){
     const n = Number(value);
@@ -1131,6 +1139,26 @@ function fitAllNodesViewport(){
     viewport.scale = nextScale;
     viewport.x = rect.width / 2 - cx * viewport.scale;
     viewport.y = rect.height / 2 - cy * viewport.scale;
+    applyViewport();
+    renderLinks();
+    renderSelectionHub();
+    scheduleViewportSave();
+}
+function zoomToNodes(targetNodes){
+    const list = (targetNodes || []).filter(Boolean);
+    if(!list.length) return;
+    const rect = board.getBoundingClientRect();
+    const rects = list.map(estimatedNodeRect);
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.w));
+    const maxY = Math.max(...rects.map(r => r.y + r.h));
+    const pad = 160;
+    const width = Math.max(1, maxX - minX + pad * 2);
+    const height = Math.max(1, maxY - minY + pad * 2);
+    viewport.scale = Math.max(0.08, Math.min(0.9, (rect.width - 80) / width, (rect.height - 120) / height));
+    viewport.x = rect.width / 2 - ((minX + maxX) / 2) * viewport.scale;
+    viewport.y = rect.height / 2 - ((minY + maxY) / 2) * viewport.scale;
     applyViewport();
     renderLinks();
     renderSelectionHub();
@@ -2347,7 +2375,8 @@ function addJsonSplitterNode(point){
         sourceText:'',         // 上游 LLM 的原始 outputText
         sourceItems:[],        // 拆分后的字符串数组（自动 stringify）
         outputPorts:0,         // 输出端口数（动态计算 = sourceItems.length）
-        running:false
+        running:false,
+        selectedSourceKey:''   // 自动识别时命中的 key（UI 调试用）
     });
 }
 // 兼容旧名（防止其他代码引用）
@@ -5634,7 +5663,10 @@ function renderNode(node){
     const el = document.createElement('div');
     const size = defaultNodeSize(node.type);
     const hasFixedSize = Boolean(node.h || size.h);
-    el.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} ${hasFixedSize ? 'sized' : ''} ${selected.has(node.id) ? 'selected' : ''}`;
+    const activeWorkflowNodes = activeDetectedWorkflowNodeSet();
+    const workflowActive = activeWorkflowNodes.has(node.id);
+    const workflowDimmed = activeWorkflowNodes.size > 0 && !workflowActive;
+    el.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} ${hasFixedSize ? 'sized' : ''} ${selected.has(node.id) ? 'selected' : ''} ${workflowActive ? 'workflow-active' : ''} ${workflowDimmed ? 'workflow-dimmed' : ''}`;
     el.style.left = `${node.x}px`;
     el.style.top = `${node.y}px`;
     el.style.width = `${node.w || size.w}px`;
@@ -9778,24 +9810,6 @@ function jsonSplitterInputText(node){
     }
     return source.outputText || '';
 }
-function parseJsonSplitterItems(sourceText){
-    let parsed;
-    try { parsed = JSON.parse(sourceText); }
-    catch(_) { parsed = sourceText; }
-    let items = [];
-    const promptArray = findJsonPromptArray(parsed);
-    if(promptArray){
-        items = promptArray.map(jsonPromptValueToText);
-    } else if(Array.isArray(parsed)){
-        items = parsed;
-    } else if(parsed && typeof parsed === 'object'){
-        const firstArrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-        items = firstArrayKey ? parsed[firstArrayKey] : [parsed];
-    } else {
-        items = [parsed];
-    }
-    return items.map(jsonValueToText);
-}
 const JSON_PROMPT_ARRAY_KEY_RANK = new Map([
     ['prompts', 0],
     ['prompt', 1],
@@ -9808,13 +9822,67 @@ const JSON_PROMPT_TEXT_KEYS = ['content', 'prompt', 'text', 'description'];
 function normalizedJsonPromptKey(key){
     return String(key || '').replace(/[\s-]+/g, '_').toLowerCase();
 }
+function stripJsonMarkdownFence(text){
+    const trimmed = String(text || '').trim();
+    const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    return match ? match[1].trim() : trimmed;
+}
+function extractBalancedJsonText(text){
+    const source = stripJsonMarkdownFence(text);
+    const start = Math.min(
+        ...['{', '['].map(ch => {
+            const index = source.indexOf(ch);
+            return index < 0 ? Infinity : index;
+        })
+    );
+    if(!Number.isFinite(start)) return source;
+    const stack = [];
+    let inString = false;
+    let escape = false;
+    for(let i = start; i < source.length; i++){
+        const ch = source[i];
+        if(inString){
+            if(escape){ escape = false; continue; }
+            if(ch === '\\'){ escape = true; continue; }
+            if(ch === '"') inString = false;
+            continue;
+        }
+        if(ch === '"'){ inString = true; continue; }
+        if(ch === '{' || ch === '['){ stack.push(ch); continue; }
+        if(ch === '}' || ch === ']'){
+            const open = stack.pop();
+            if((ch === '}' && open !== '{') || (ch === ']' && open !== '[')) return source;
+            if(!stack.length) return source.slice(start, i + 1).trim();
+        }
+    }
+    return source;
+}
+function parseJsonForSplitter(sourceText){
+    const raw = String(sourceText || '');
+    const candidates = [raw, stripJsonMarkdownFence(raw), extractBalancedJsonText(raw)];
+    const seen = new Set();
+    for(const candidate of candidates){
+        if(seen.has(candidate)) continue;
+        seen.add(candidate);
+        try { return JSON.parse(candidate); }
+        catch(_) {}
+    }
+    return sourceText;
+}
 function jsonPromptArrayKeyRank(key){
     const normalized = normalizedJsonPromptKey(key);
     return JSON_PROMPT_ARRAY_KEY_RANK.has(normalized) ? JSON_PROMPT_ARRAY_KEY_RANK.get(normalized) : Infinity;
 }
+function numberedJsonPromptKeyIndex(key){
+    const match = normalizedJsonPromptKey(key).match(/^prompt_?(\d+)(?:_|$)/);
+    return match ? Number(match[1]) : null;
+}
 function isJsonPromptArrayKey(key){
     const normalized = normalizedJsonPromptKey(key);
     return JSON_PROMPT_ARRAY_KEY_RANK.has(normalized) || normalized.includes('prompt');
+}
+function isJsonPromptObjectKey(key){
+    return isJsonPromptArrayKey(key);
 }
 function jsonPromptTextScore(items){
     if(!Array.isArray(items) || !items.length) return 0;
@@ -9829,6 +9897,21 @@ function jsonPromptTextScore(items){
         return score;
     }, 0);
 }
+function numberedPromptItemsFromObject(value){
+    if(!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.keys(value)
+        .map(key => ({key, index:numberedJsonPromptKeyIndex(key), value:value[key]}))
+        .filter(item => Number.isFinite(item.index));
+    if(entries.length < 2) return null;
+    entries.sort((a, b) => a.index - b.index || String(a.key).localeCompare(String(b.key)));
+    return {
+        kind: 'numbered-object',
+        key: entries.map(item => item.key).join(','),
+        items: entries.map(item => item.value),
+        rank: Infinity,
+        score: jsonPromptTextScore(entries.map(item => item.value))
+    };
+}
 function collectJsonPromptArrays(value, out=[], seen=new Set()){
     if(!value || typeof value !== 'object' || seen.has(value)) return out;
     seen.add(value);
@@ -9836,14 +9919,26 @@ function collectJsonPromptArrays(value, out=[], seen=new Set()){
         value.forEach(item => collectJsonPromptArrays(item, out, seen));
         return out;
     }
+    const numberedItems = numberedPromptItemsFromObject(value);
+    if(numberedItems) out.push(numberedItems);
     Object.keys(value).forEach(key => {
         const child = value[key];
         if(Array.isArray(child) && isJsonPromptArrayKey(key)){
             out.push({
+                kind: 'array',
                 key,
-                items:child,
-                rank:jsonPromptArrayKeyRank(key),
-                score:jsonPromptTextScore(child)
+                items: child,
+                rank: jsonPromptArrayKeyRank(key),
+                score: jsonPromptTextScore(child)
+            });
+        } else if(child && typeof child === 'object' && !Array.isArray(child) && isJsonPromptObjectKey(key)){
+            const values = Object.values(child);
+            out.push({
+                kind: 'object',
+                key,
+                items: values,
+                rank: jsonPromptArrayKeyRank(key),
+                score: jsonPromptTextScore(values)
             });
         }
         collectJsonPromptArrays(child, out, seen);
@@ -9854,15 +9949,37 @@ function findJsonPromptArray(parsed){
     const candidates = collectJsonPromptArrays(parsed);
     if(!candidates.length) return null;
     candidates.sort((a, b) => (a.rank - b.rank) || (b.score - a.score) || (b.items.length - a.items.length));
-    return candidates[0].items;
+    return candidates[0];
 }
 function jsonPromptValueToText(value){
     if(value && typeof value === 'object' && !Array.isArray(value)){
+        // 1) 标准键优先：content / prompt / text / description
         for(const key of JSON_PROMPT_TEXT_KEYS){
             if(typeof value[key] === 'string' && value[key].trim()) return value[key];
         }
+        // 2) 兜底：没有标准键时，从所有字符串值里挑**最长**的
+        //    适用场景：{无文字主图版, 带文字广告版} / {v1, v2} / {main, alt} 等
+        //    「最长」= 最可能是完整 prompt 文本（短的通常是标题/摘要）
+        const stringValues = Object.values(value).filter(v => typeof v === 'string' && v.trim());
+        if(stringValues.length) return stringValues.reduce((a, b) => a.length >= b.length ? a : b);
     }
     return jsonValueToText(value);
+}
+function parseJsonSplitterItems(sourceText){
+    const parsed = parseJsonForSplitter(sourceText);
+    let items = [];
+    const promptContainer = findJsonPromptArray(parsed);
+    if(promptContainer){
+        items = promptContainer.items.map(jsonPromptValueToText);
+    } else if(Array.isArray(parsed)){
+        items = parsed;
+    } else if(parsed && typeof parsed === 'object'){
+        const firstArrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
+        items = firstArrayKey ? parsed[firstArrayKey] : [parsed];
+    } else {
+        items = [parsed];
+    }
+    return items.map(jsonValueToText);
 }
 function applyJsonSplitterSource(node, sourceText){
     const text = String(sourceText || '');
@@ -9873,6 +9990,16 @@ function applyJsonSplitterSource(node, sourceText){
     node.sourceText = text;
     node.sourceItems = nextItems;
     node.outputPorts = nextItems.length;
+    // 记录自动识别命中的 key（供 UI 调试展示，不参与拆分逻辑）
+    if(text){
+        try {
+            const parsed = parseJsonForSplitter(text);
+            const c = findJsonPromptArray(parsed);
+            node.selectedSourceKey = c ? c.key : '';
+        } catch(_) { node.selectedSourceKey = ''; }
+    } else {
+        node.selectedSourceKey = '';
+    }
     if(text){
         node.runStatus = 'done';
         node.runError = '';
@@ -11038,6 +11165,7 @@ function renderJsonExtractorBody(node){
     wrap.className = 'llm-body jsplitter-body';
     const items = node.sourceItems || [];
     const itemCount = items.length;
+    const detectedKey = String(node.selectedSourceKey || '');
 
     // 动态生成 N 个矩形框（N = sourceItems.length）
     // 每个 box 右侧的真实输出端口由 renderNode 步骤 2 插入
@@ -11052,9 +11180,14 @@ function renderJsonExtractorBody(node){
             </div>`;
         }).join('');
 
+    const detectedLine = detectedKey
+        ? `<div class="jsplitter-detected">${langIsEn() ? 'Detected from' : '识别自'}：<code>${escapeHtml(detectedKey)}</code></div>`
+        : '';
+
     wrap.innerHTML = `
         <div class="llm-pane-label">拆分结果（${itemCount} 个端口）</div>
         <div class="jsplitter-list">${boxes}</div>
+        ${detectedLine}
         <div class="gen-run-row mt-2">
             <button class="llm-run jsonex-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? '运行中' : '运行 json 拆分'}</button>
             ${cascadeBtnHtml(node)}
@@ -11463,6 +11596,39 @@ async function runNodeCascade(nodeId){
     loopContext = null;
     finalizeCascade(nodeId, 'done', {order});
 }
+async function runCascadeNodeOnce(id, targetId=''){
+    const node = nodes.find(n => n.id === id);
+    if(!node) return null;
+    const ctx = cascadeContextFor(targetId);
+    if(ctx) ctx.currentNodeId = id;
+    node.runStatus = 'running';
+    refreshNodes([id]);
+    try {
+        if(node.type === 'generator') await runGenerator(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'msgen') await runMsGenNode(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'llm') await runLLMNode(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'json-extractor' || node.type === 'json-splitter') await runJsonExtractorNode(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'video') await runVideoNode(id, {cascade:true, cascadeTargetId:targetId});
+        else if(node.type === 'rh') await runRhNode(id, {cascade:true, cascadeTargetId:targetId});
+        if(targetId) ensureCascadeActive(targetId);
+        node.runStatus = 'done';
+        refreshNodes([id]);
+        return node;
+    } catch(err) {
+        if(isCascadeAbortError(err)){
+            clearCascadeNodeState(node);
+            refreshNodes([id]);
+            throw err;
+        }
+        node.runStatus = 'failed';
+        node.runError = err.message || String(err);
+        node._cascadeFailed = true;
+        refreshNodes([id]);
+        throw err;
+    }
+}
 async function runOneCascadePass(order, options={}){
     const targetId = cascadeTargetIdFromOptions(options);
     order.forEach(id => {
@@ -11475,28 +11641,28 @@ async function runOneCascadePass(order, options={}){
         const id = order[i];
         const node = nodes.find(n => n.id === id);
         if(!node) continue;
-        const ctx = cascadeContextFor(targetId);
-        if(ctx) ctx.currentNodeId = id;
-        node.runStatus = 'running';
-        refreshNodes([id]);
+        await runCascadeNodeOnce(id, targetId);
+    }
+}
+async function runCascadeLayers(layers, options={}){
+    const targetId = cascadeTargetIdFromOptions(options);
+    const order = (layers || []).flat();
+    order.forEach(id => {
+        const n = nodes.find(x => x.id === id);
+        if(n){ n.runStatus = 'queued'; n.runError = ''; n._cascadeFailed = false; n._cascadeIdx = ''; }
+    });
+    refreshNodes(order);
+    for(const layer of (layers || [])){
+        const ids = (layer || []).filter(id => nodes.some(node => node.id === id));
+        if(!ids.length) continue;
+        if(targetId) ensureCascadeActive(targetId);
         try {
-            if(node.type === 'generator') await runGenerator(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'msgen') await runMsGenNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'llm') await runLLMNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'json-extractor' || node.type === 'json-splitter') await runJsonExtractorNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'video') await runVideoNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'rh') await runRhNode(id, {cascade:true, cascadeTargetId:targetId});
-            if(targetId) ensureCascadeActive(targetId);
-            node.runStatus = 'done';
-            refreshNodes([id]);
+            await Promise.all(ids.map(id => runCascadeNodeOnce(id, targetId)));
         } catch(err) {
-            node.runStatus = 'failed';
-            node.runError = err.message || String(err);
-            node._cascadeFailed = true;
+            if(targetId && !isCascadeAbortError(err)) requestCascadeStop(targetId, err.message || String(err));
             throw err;
         }
+        if(targetId) ensureCascadeActive(targetId);
     }
 }
 // 失败重试：从该节点继续往下游跑
@@ -12390,6 +12556,20 @@ workflowTransferToggle?.addEventListener('click', () => {
     if(workflowTransferModal?.classList.contains('open')) closeWorkflowTransferModal();
     else openWorkflowTransferModal();
 });
+workflowRunSelect?.addEventListener('change', () => {
+    selectDetectedWorkflow(workflowRunSelect.value || '');
+});
+workflowRunLocateBtn?.addEventListener('click', () => {
+    locateDetectedWorkflow();
+});
+workflowRunStartBtn?.addEventListener('click', () => {
+    runDetectedWorkflow();
+});
+workflowRunStopBtn?.addEventListener('click', () => {
+    const workflow = activeDetectedWorkflow();
+    if(workflow) requestCascadeStop(workflow.id);
+    renderWorkflowRunBar();
+});
 canvasLogToggle?.addEventListener('click', event => {
     event.preventDefault();
     openCanvasLog();
@@ -13045,6 +13225,265 @@ function finishSelection(){
 function renderSelectionHub(){
     selectionHub.innerHTML = '';
     selectionHub.classList.remove('open');
+}
+const DETECTED_WORKFLOW_RUN_TYPES = new Set(['llm', 'json-splitter', 'json-extractor', 'generator', 'msgen', 'comfy', 'ltxDirector', 'video', 'rh']);
+function isDetectedWorkflowRunnableNode(node){
+    return DETECTED_WORKFLOW_RUN_TYPES.has(node?.type);
+}
+function detectedWorkflowNodeSort(a, b){
+    return (Number(a.x || 0) - Number(b.x || 0)) || (Number(a.y || 0) - Number(b.y || 0)) || String(a.id).localeCompare(String(b.id));
+}
+function detectCanvasWorkflows(){
+    const nodeList = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
+    const nodeById = new Map(nodeList.map(node => [node.id, node]));
+    const adjacency = new Map(nodeList.map(node => [node.id, new Set()]));
+    (connections || []).forEach(connection => {
+        if(!nodeById.has(connection.from) || !nodeById.has(connection.to)) return;
+        adjacency.get(connection.from)?.add(connection.to);
+        adjacency.get(connection.to)?.add(connection.from);
+    });
+    nodeList.forEach(node => {
+        if(!Array.isArray(node.items)) return;
+        node.items.forEach(itemId => {
+            if(!nodeById.has(itemId)) return;
+            adjacency.get(node.id)?.add(itemId);
+            adjacency.get(itemId)?.add(node.id);
+        });
+    });
+    const visited = new Set();
+    const groups = [];
+    nodeList.slice().sort(detectedWorkflowNodeSort).forEach(start => {
+        if(visited.has(start.id)) return;
+        const queue = [start.id];
+        const ids = [];
+        visited.add(start.id);
+        while(queue.length){
+            const id = queue.shift();
+            ids.push(id);
+            (adjacency.get(id) || new Set()).forEach(next => {
+                if(visited.has(next)) return;
+                visited.add(next);
+                queue.push(next);
+            });
+        }
+        const groupNodes = ids.map(id => nodeById.get(id)).filter(Boolean).sort(detectedWorkflowNodeSort);
+        const runnableIds = groupNodes.filter(isDetectedWorkflowRunnableNode).map(node => node.id);
+        if(!runnableIds.length) return;
+        const idSet = new Set(groupNodes.map(node => node.id));
+        const groupConnections = (connections || []).filter(connection => idSet.has(connection.from) && idSet.has(connection.to));
+        const bounds = workflowBoundsForNodes(groupNodes);
+        const index = groups.length + 1;
+        groups.push({
+            id: `workflow_${index}`,
+            label: `工作流 ${index} · ${groupNodes.length} 节点 · ${groupConnections.length} 连线`,
+            nodeIds: groupNodes.map(node => node.id),
+            runnableIds,
+            connectionIds: groupConnections.map(connection => connection.id),
+            nodeCount: groupNodes.length,
+            connectionCount: groupConnections.length,
+            bounds,
+            sortX: bounds.x,
+            sortY: bounds.y
+        });
+    });
+    return groups.sort((a, b) => (a.sortX - b.sortX) || (a.sortY - b.sortY) || a.id.localeCompare(b.id))
+        .map((workflow, index) => ({
+            ...workflow,
+            id: `workflow_${index + 1}`,
+            label: `工作流 ${index + 1} · ${workflow.nodeCount} 节点 · ${workflow.connectionCount} 连线`
+        }));
+}
+function workflowBoundsForNodes(list){
+    if(!list.length) return {x:0, y:0, w:0, h:0};
+    const rects = list.map(node => ({
+        x: Number(node.x || 0),
+        y: Number(node.y || 0),
+        w: Number(node.w || 260),
+        h: Number(node.h || 200)
+    }));
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.w));
+    const maxY = Math.max(...rects.map(r => r.y + r.h));
+    return {x:minX, y:minY, w:maxX - minX, h:maxY - minY};
+}
+function activeDetectedWorkflow(){
+    return detectedWorkflows.find(workflow => workflow.id === activeDetectedWorkflowId) || null;
+}
+function activeDetectedWorkflowNodeSet(){
+    return new Set(activeDetectedWorkflow()?.nodeIds || []);
+}
+function activeDetectedWorkflowConnectionSet(){
+    return new Set(activeDetectedWorkflow()?.connectionIds || []);
+}
+function computeWorkflowRunGraph(workflow){
+    const nodeById = new Map((nodes || []).filter(Boolean).map(node => [node.id, node]));
+    const workflowNodeIds = new Set(workflow?.nodeIds || []);
+    const runnableIds = (workflow?.runnableIds || []).filter(id => workflowNodeIds.has(id) && isDetectedWorkflowRunnableNode(nodeById.get(id)));
+    const runnableSet = new Set(runnableIds);
+    const edges = new Map(runnableIds.map(id => [id, new Set()]));
+    const indegree = new Map(runnableIds.map(id => [id, 0]));
+    const incomingPortRank = new Map();
+    const outgoing = new Map();
+    (connections || []).forEach(connection => {
+        if(!workflowNodeIds.has(connection.from) || !workflowNodeIds.has(connection.to)) return;
+        if(!outgoing.has(connection.from)) outgoing.set(connection.from, []);
+        outgoing.get(connection.from).push(connection.to);
+        const fromNode = nodeById.get(connection.from);
+        if((fromNode?.type === 'json-splitter' || fromNode?.type === 'json-extractor') && runnableSet.has(connection.to)){
+            const port = Number.isFinite(Number(connection.fromPort)) ? Number(connection.fromPort) : Infinity;
+            incomingPortRank.set(connection.to, Math.min(incomingPortRank.get(connection.to) ?? Infinity, port));
+        }
+    });
+    const addEdge = (from, to) => {
+        if(from === to || !runnableSet.has(from) || !runnableSet.has(to)) return;
+        const set = edges.get(from);
+        if(set.has(to)) return;
+        set.add(to);
+        indegree.set(to, (indegree.get(to) || 0) + 1);
+    };
+    runnableIds.forEach(from => {
+        const queue = [...(outgoing.get(from) || [])];
+        const seen = new Set();
+        while(queue.length){
+            const next = queue.shift();
+            if(seen.has(next) || !workflowNodeIds.has(next)) continue;
+            seen.add(next);
+            if(runnableSet.has(next)){
+                addEdge(from, next);
+                continue;
+            }
+            (outgoing.get(next) || []).forEach(child => queue.push(child));
+        }
+    });
+    const sortRunnable = (a, b) => {
+        const portDelta = (incomingPortRank.get(a) ?? Infinity) - (incomingPortRank.get(b) ?? Infinity);
+        if(Number.isFinite(portDelta) && portDelta !== 0) return portDelta;
+        return detectedWorkflowNodeSort(nodeById.get(a) || {id:a}, nodeById.get(b) || {id:b});
+    };
+    return {runnableIds, edges, indegree, sortRunnable};
+}
+function computeWorkflowRunOrder(workflow){
+    const graph = computeWorkflowRunGraph(workflow);
+    const runnableIds = graph.runnableIds;
+    const indegree = new Map(graph.indegree);
+    const ready = runnableIds.filter(id => (indegree.get(id) || 0) === 0).sort(graph.sortRunnable);
+    const order = [];
+    while(ready.length){
+        const id = ready.shift();
+        order.push(id);
+        [...(graph.edges.get(id) || [])].sort(graph.sortRunnable).forEach(to => {
+            indegree.set(to, (indegree.get(to) || 0) - 1);
+            if(indegree.get(to) === 0) ready.push(to);
+        });
+        ready.sort(graph.sortRunnable);
+    }
+    if(order.length !== runnableIds.length){
+        const missing = runnableIds.filter(id => !order.includes(id)).sort(graph.sortRunnable);
+        order.push(...missing);
+    }
+    return order;
+}
+function computeWorkflowRunPlan(workflow){
+    const graph = computeWorkflowRunGraph(workflow);
+    const runnableIds = graph.runnableIds;
+    const indegree = new Map(graph.indegree);
+    let ready = runnableIds.filter(id => (indegree.get(id) || 0) === 0).sort(graph.sortRunnable);
+    const layers = [];
+    const order = [];
+    while(ready.length){
+        const layer = ready.slice().sort(graph.sortRunnable);
+        layers.push(layer);
+        order.push(...layer);
+        const nextReady = [];
+        layer.forEach(id => {
+            [...(graph.edges.get(id) || [])].sort(graph.sortRunnable).forEach(to => {
+                indegree.set(to, (indegree.get(to) || 0) - 1);
+                if(indegree.get(to) === 0) nextReady.push(to);
+            });
+        });
+        ready = nextReady.sort(graph.sortRunnable);
+    }
+    if(order.length !== runnableIds.length){
+        const missing = runnableIds.filter(id => !order.includes(id)).sort(graph.sortRunnable);
+        if(missing.length){
+            layers.push(missing);
+            order.push(...missing);
+        }
+    }
+    return {order, layers};
+}
+function chooseDetectedWorkflowActiveId(currentId, workflows){
+    const list = Array.isArray(workflows) ? workflows : [];
+    if(currentId && list.some(workflow => workflow.id === currentId)) return currentId;
+    return list[0]?.id || '';
+}
+function renderWorkflowRunBar(){
+    if(!workflowRunBar || !workflowRunSelect) return;
+    detectedWorkflows = detectCanvasWorkflows();
+    activeDetectedWorkflowId = chooseDetectedWorkflowActiveId(activeDetectedWorkflowId, detectedWorkflows);
+    workflowRunBar.classList.toggle('empty', detectedWorkflows.length === 0);
+    workflowRunSelect.innerHTML = detectedWorkflows.length
+        ? detectedWorkflows.map(workflow => `<option value="${escapeAttr(workflow.id)}" ${workflow.id === activeDetectedWorkflowId ? 'selected' : ''}>${escapeHtml(workflow.label)}</option>`).join('')
+        : '<option value="">未识别到可运行工作流</option>';
+    const active = activeDetectedWorkflow();
+    const running = Boolean(active && isCascadeActive(active.id));
+    if(workflowRunLocateBtn) workflowRunLocateBtn.disabled = !active;
+    if(workflowRunStartBtn) workflowRunStartBtn.disabled = !active || running;
+    if(workflowRunStopBtn) workflowRunStopBtn.disabled = !active || !running || isCascadeStopping(active.id);
+    workflowRunBar.classList.toggle('running', running);
+    refreshIcons();
+}
+function selectDetectedWorkflow(workflowId){
+    const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
+    activeDetectedWorkflowId = workflow?.id || '';
+    selected.clear();
+    (workflow?.nodeIds || []).forEach(id => selected.add(id));
+    refreshSelectionVisuals();
+    if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
+    renderWorkflowRunBar();
+}
+function locateDetectedWorkflow(workflowId=activeDetectedWorkflowId){
+    const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
+    if(!workflow) return;
+    const workflowNodes = workflow.nodeIds.map(id => nodes.find(node => node.id === id)).filter(Boolean);
+    if(!workflowNodes.length) return;
+    zoomToNodes(workflowNodes);
+}
+async function runDetectedWorkflow(workflowId=activeDetectedWorkflowId){
+    const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
+    if(!workflow) return;
+    if(isCascadeActive(workflow.id)) return;
+    const plan = computeWorkflowRunPlan(workflow);
+    const order = plan.order;
+    if(!order.length){
+        alert('该工作流没有可运行节点');
+        return;
+    }
+    selectDetectedWorkflow(workflow.id);
+    const ctx = beginCascade(workflow.id, order, {mode:'detected-workflow-parallel'});
+    renderWorkflowRunBar();
+    try {
+        await runCascadeLayers(plan.layers, {cascadeTargetId:workflow.id});
+        finalizeCascade(workflow.id, 'done', {order});
+    } catch(err) {
+        if(isCascadeAbortError(err)){
+            finalizeCascade(workflow.id, 'stopped', {order});
+            return;
+        }
+        const failed = nodes.find(node => order.includes(node.id) && node._cascadeFailed)
+            || nodes.find(node => node.id === ctx.currentNodeId)
+            || nodes.find(node => node.id === order[0]);
+        if(failed){
+            failed.runStatus = 'failed';
+            failed.runError = err.message || String(err);
+            failed._cascadeFailed = true;
+        }
+        finalizeCascade(workflow.id, 'failed', {order});
+        refreshNodes(order);
+    } finally {
+        renderWorkflowRunBar();
+    }
 }
 function startSelectionLink(e, kind){
     e.preventDefault();
@@ -13761,8 +14200,11 @@ function renderLinks(){
         // 多输出：connection.fromPort 决定从哪个端口出发
         segments.push({c, a:portPoint(c.from, 'out', c.fromPort), b:portPoint(c.to, 'in')});
     });
+    const activeWorkflowConnections = activeDetectedWorkflowConnectionSet();
     segments.forEach(({c, a, b}) => {
-        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, 'link'));
+        const workflowActive = activeWorkflowConnections.has(c.id);
+        const workflowDimmed = activeWorkflowConnections.size > 0 && !workflowActive;
+        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link ${workflowActive ? 'workflow-active' : ''} ${workflowDimmed ? 'workflow-dimmed' : ''}`));
         linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
     });
@@ -13845,8 +14287,12 @@ function isConnectionSelected(connection){
     return selected.has(connection.from) || selected.has(connection.to);
 }
 function refreshSelectionVisuals(){
+    const activeWorkflowNodes = activeDetectedWorkflowNodeSet();
     nodesEl.querySelectorAll('.node').forEach(el => {
         el.classList.toggle('selected', selected.has(el.dataset.id));
+        const workflowActive = activeWorkflowNodes.has(el.dataset.id);
+        el.classList.toggle('workflow-active', workflowActive);
+        el.classList.toggle('workflow-dimmed', activeWorkflowNodes.size > 0 && !workflowActive);
     });
     renderLinks();
     renderSelectionHub();
