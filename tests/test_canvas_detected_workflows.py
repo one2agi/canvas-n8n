@@ -27,13 +27,14 @@ def _extract_cascade_layer_runner(code: str) -> str:
     return code[start:end]
 
 
-def run_workflow_algorithm(nodes, connections):
+def run_workflow_algorithm(nodes, connections, workflow_names=None):
     with open(CANVAS_JS, "r", encoding="utf-8") as f:
         code = f.read()
     algo = _extract_workflow_algorithm(code)
     driver = f"""
 let nodes = {json.dumps(nodes, ensure_ascii=False)};
 let connections = {json.dumps(connections, ensure_ascii=False)};
+let canvas = {{automation_workflow_names: {json.dumps(workflow_names or {}, ensure_ascii=False)}}};
 {algo}
 const workflows = detectCanvasWorkflows();
 const orders = workflows.map(w => computeWorkflowRunOrder(w));
@@ -143,6 +144,34 @@ class CanvasDetectedWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(result["orders"][1], ["gen_b"])
         self.assertEqual(result["plans"][1]["layers"], [["gen_b"]])
+
+    def test_detected_workflow_key_is_stable_and_label_uses_custom_name(self):
+        nodes = [
+            {"id": "b_node", "type": "generator", "x": 100, "y": 300},
+            {"id": "a_node", "type": "prompt", "x": 0, "y": 0},
+        ]
+        connections = [{"id": "c1", "from": "a_node", "to": "b_node"}]
+        key = "2d5b5b0a2ddb3698"
+
+        result = run_workflow_algorithm(
+            nodes,
+            connections,
+            {key: {"name": "dress-main", "updated_at": 1}},
+        )
+
+        self.assertNotIn("error", result, msg=result.get("error"))
+        workflow = result["workflows"][0]
+        self.assertEqual(workflow["workflowKey"], key)
+        self.assertEqual(workflow["name"], "dress-main")
+        self.assertEqual(workflow["customName"], "dress-main")
+        self.assertEqual(workflow["label"], "dress-main · 2 节点 · 1 连线")
+
+        moved = [
+            {"id": "b_node", "type": "generator", "x": 900, "y": 100},
+            {"id": "a_node", "type": "prompt", "x": 800, "y": 100},
+        ]
+        moved_result = run_workflow_algorithm(moved, connections)
+        self.assertEqual(moved_result["workflows"][0]["workflowKey"], key)
 
     def test_single_unconnected_runnable_node_is_a_workflow(self):
         nodes = [

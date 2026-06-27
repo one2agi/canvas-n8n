@@ -37,12 +37,22 @@ def parse_args(argv=None):
     canvas_workflows_parser.add_argument("--server", default=DEFAULT_SERVER, help="Infinite-Canvas server URL")
     canvas_workflows_parser.add_argument("--canvas", required=True, help="Saved canvas ID")
 
+    rename_canvas_workflow_parser = sub.add_parser(
+        "rename-canvas-workflow",
+        help="Set or clear a detected canvas sub-workflow name",
+    )
+    rename_canvas_workflow_parser.add_argument("--server", default=DEFAULT_SERVER, help="Infinite-Canvas server URL")
+    rename_canvas_workflow_parser.add_argument("--canvas", required=True, help="Saved canvas ID")
+    rename_canvas_workflow_parser.add_argument("--workflow-key", required=True, help="Canvas sub-workflow stable key")
+    rename_canvas_workflow_parser.add_argument("--name", required=True, help="New sub-workflow name; blank clears it")
+
     run_parser = sub.add_parser("run", help="Run an automation workflow from a preset or saved canvas")
     run_parser.add_argument("--server", default=DEFAULT_SERVER, help="Infinite-Canvas server URL")
     source_group = run_parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--workflow", default="", help="Automation workflow preset name")
     source_group.add_argument("--canvas", default="", help="Saved canvas ID")
     run_parser.add_argument("--canvas-workflow", default="", help="Canvas sub-workflow ID; requires --canvas")
+    run_parser.add_argument("--canvas-workflow-name", default="", help="Canvas sub-workflow custom name; requires --canvas")
     run_parser.add_argument("--image-url", action="append", default=[], help="Input image URL; can be repeated")
     run_parser.add_argument("--image-list", default="", help="Text file containing one image URL per line")
     run_parser.add_argument("--image-file", action="append", default=[], help="Local image file to upload; can be repeated")
@@ -53,6 +63,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if getattr(args, "command", "") == "run" and getattr(args, "canvas_workflow", "") and not getattr(args, "canvas", ""):
         raise SystemExit("--canvas-workflow requires --canvas; it cannot be used with --workflow")
+    if getattr(args, "command", "") == "run" and getattr(args, "canvas_workflow_name", "") and not getattr(args, "canvas", ""):
+        raise SystemExit("--canvas-workflow-name requires --canvas; it cannot be used with --workflow")
+    if getattr(args, "command", "") == "run" and getattr(args, "canvas_workflow", "") and getattr(args, "canvas_workflow_name", ""):
+        raise SystemExit("--canvas-workflow and --canvas-workflow-name cannot be used together")
     return args
 
 
@@ -150,6 +164,19 @@ def list_canvas_workflows_command(args, stdout=sys.stdout):
     return 0
 
 
+def rename_canvas_workflow_command(args, stdout=sys.stdout):
+    server = normalized_server(args.server)
+    canvas_id = urllib.parse.quote(str(args.canvas), safe="")
+    workflow_key = urllib.parse.quote(str(args.workflow_key), safe="")
+    data = json_request(
+        "PATCH",
+        f"{server}/api/automation/canvases/{canvas_id}/workflows/{workflow_key}/name",
+        {"name": args.name},
+    )
+    print_json(data, stdout)
+    return 0
+
+
 def wait_for_task(server, task_id, interval, timeout, stdout):
     start = time.time()
     while True:
@@ -183,6 +210,8 @@ def run_command(args, stdout=sys.stdout):
         payload["canvas_id"] = args.canvas
         if args.canvas_workflow:
             payload["canvas_workflow_id"] = args.canvas_workflow
+        if args.canvas_workflow_name:
+            payload["canvas_workflow_name"] = args.canvas_workflow_name
     else:
         payload["workflow_name"] = args.workflow
     result = json_request("POST", f"{server}/api/automation/workflow-runs", payload)
@@ -205,6 +234,8 @@ def main(argv=None, stdout=sys.stdout, stderr=sys.stderr):
             return list_canvases_command(args, stdout)
         if args.command == "list-canvas-workflows":
             return list_canvas_workflows_command(args, stdout)
+        if args.command == "rename-canvas-workflow":
+            return rename_canvas_workflow_command(args, stdout)
         if args.command == "run":
             return run_command(args, stdout)
         raise SystemExit(f"Unknown command: {args.command}")

@@ -85,7 +85,7 @@ class AutomationCliTests(unittest.TestCase):
 
         def fake_json_request(method, url, payload=None):
             calls.append((method, url, payload))
-            return {"workflows": [{"id": "wf_a", "name": "product-main"}]}
+            return {"workflows": [{"id": "wf_a", "workflow_key": "key123", "name": "product-main"}]}
 
         out = StringIO()
         args = automation_cli.parse_args([
@@ -104,6 +104,35 @@ class AutomationCliTests(unittest.TestCase):
             None,
         )])
         self.assertIn("wf_a", out.getvalue())
+        self.assertIn("key123", out.getvalue())
+        self.assertIn("product-main", out.getvalue())
+
+    def test_rename_canvas_workflow_patches_name(self):
+        calls = []
+
+        def fake_json_request(method, url, payload=None):
+            calls.append((method, url, payload))
+            return {"workflow": {"workflow_key": "key123", "name": "dress-main"}}
+
+        out = StringIO()
+        args = automation_cli.parse_args([
+            "rename-canvas-workflow",
+            "--server", "http://127.0.0.1:3000",
+            "--canvas", "canvas123",
+            "--workflow-key", "key123",
+            "--name", "dress-main",
+        ])
+
+        with patch.object(automation_cli, "json_request", side_effect=fake_json_request):
+            exit_code = automation_cli.rename_canvas_workflow_command(args, stdout=out)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [(
+            "PATCH",
+            "http://127.0.0.1:3000/api/automation/canvases/canvas123/workflows/key123/name",
+            {"name": "dress-main"},
+        )])
+        self.assertIn("dress-main", out.getvalue())
 
     def test_run_no_wait_posts_canvas_id_and_prints_task_id(self):
         calls = []
@@ -159,6 +188,46 @@ class AutomationCliTests(unittest.TestCase):
             "image_urls": ["https://example.com/product.png"],
             "callback_url": "",
         })
+
+    def test_run_canvas_workflow_name_posts_canvas_workflow_name(self):
+        calls = []
+
+        def fake_json_request(method, url, payload=None):
+            calls.append((method, url, payload))
+            return {"task_id": "auto_canvas", "status": "queued"}
+
+        out = StringIO()
+        args = automation_cli.parse_args([
+            "run",
+            "--server", "http://127.0.0.1:3000",
+            "--canvas", "canvas123",
+            "--canvas-workflow-name", "dress-main",
+            "--image-url", "https://example.com/product.png",
+            "--no-wait",
+        ])
+
+        with patch.object(automation_cli, "json_request", side_effect=fake_json_request):
+            exit_code = automation_cli.run_command(args, stdout=out)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls[0][2], {
+            "canvas_id": "canvas123",
+            "canvas_workflow_name": "dress-main",
+            "image_urls": ["https://example.com/product.png"],
+            "callback_url": "",
+        })
+
+    def test_run_rejects_canvas_workflow_id_and_name_together(self):
+        with self.assertRaises(SystemExit) as ctx:
+            automation_cli.parse_args([
+                "run",
+                "--canvas", "canvas123",
+                "--canvas-workflow", "workflow_2",
+                "--canvas-workflow-name", "dress-main",
+                "--image-url", "https://example.com/product.png",
+            ])
+
+        self.assertIn("--canvas-workflow and --canvas-workflow-name cannot be used together", str(ctx.exception))
 
     def test_run_rejects_workflow_and_canvas_workflow_together(self):
         with self.assertRaises(SystemExit) as ctx:

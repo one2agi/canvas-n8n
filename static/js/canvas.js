@@ -245,6 +245,7 @@ const workflowImportDropZone = document.getElementById('workflowImportDropZone')
 const workflowExportLibraryBtn = document.getElementById('workflowExportLibraryBtn');
 const workflowRunBar = document.getElementById('workflowRunBar');
 const workflowRunSelect = document.getElementById('workflowRunSelect');
+const workflowRunRenameBtn = document.getElementById('workflowRunRenameBtn');
 const workflowRunLocateBtn = document.getElementById('workflowRunLocateBtn');
 const workflowRunStartBtn = document.getElementById('workflowRunStartBtn');
 const workflowRunStopBtn = document.getElementById('workflowRunStopBtn');
@@ -12562,6 +12563,9 @@ workflowRunSelect?.addEventListener('change', () => {
 workflowRunLocateBtn?.addEventListener('click', () => {
     locateDetectedWorkflow();
 });
+workflowRunRenameBtn?.addEventListener('click', () => {
+    renameDetectedWorkflow();
+});
 workflowRunStartBtn?.addEventListener('click', () => {
     runDetectedWorkflow();
 });
@@ -13241,6 +13245,47 @@ function safeDetectedWorkflowNumber(value, fallback=0){
     const number = Number(value);
     return Number.isFinite(number) ? number : fallback;
 }
+function detectedWorkflowSha1Hex(text){
+    const bytes = new TextEncoder().encode(String(text || ''));
+    const words = [];
+    for(let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << (24 - (i % 4) * 8);
+    words[bytes.length >> 2] |= 0x80 << (24 - (bytes.length % 4) * 8);
+    words[(((bytes.length + 8) >> 6) << 4) + 15] = bytes.length * 8;
+    const rol = (value, bits) => (value << bits) | (value >>> (32 - bits));
+    const hex = value => (`00000000${(value >>> 0).toString(16)}`).slice(-8);
+    let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+    for(let i = 0; i < words.length; i += 16){
+        const w = words.slice(i, i + 16);
+        for(let t = 16; t < 80; t++) w[t] = rol((w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]) >>> 0, 1);
+        let a = h0, b = h1, c = h2, d = h3, e = h4;
+        for(let t = 0; t < 80; t++){
+            const f = t < 20 ? ((b & c) | ((~b) & d)) : t < 40 ? (b ^ c ^ d) : t < 60 ? ((b & c) | (b & d) | (c & d)) : (b ^ c ^ d);
+            const k = t < 20 ? 0x5a827999 : t < 40 ? 0x6ed9eba1 : t < 60 ? 0x8f1bbcdc : 0xca62c1d6;
+            const temp = (rol(a, 5) + f + e + k + (w[t] >>> 0)) >>> 0;
+            e = d; d = c; c = rol(b, 30) >>> 0; b = a; a = temp;
+        }
+        h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+    }
+    return [h0, h1, h2, h3, h4].map(hex).join('');
+}
+function detectedWorkflowKey(nodeIds){
+    const values = (nodeIds || []).map(id => String(id || '')).filter(Boolean).sort();
+    return values.length ? detectedWorkflowSha1Hex(values.join('|')).slice(0, 16) : '';
+}
+function detectedWorkflowNameEntries(){
+    const raw = canvas?.automation_workflow_names || {};
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+function detectedWorkflowDisplay(index, workflowKey, nodeCount, connectionCount){
+    const defaultName = `工作流 ${index}`;
+    const customName = String(detectedWorkflowNameEntries()?.[workflowKey]?.name || '').trim();
+    const name = customName || defaultName;
+    return {
+        name,
+        customName,
+        label: `${name} · ${nodeCount} 节点 · ${connectionCount} 连线`
+    };
+}
 function detectedWorkflowNodeSort(a, b){
     return (safeDetectedWorkflowNumber(a.x, 0) - safeDetectedWorkflowNumber(b.x, 0))
         || (safeDetectedWorkflowNumber(a.y, 0) - safeDetectedWorkflowNumber(b.y, 0))
@@ -13286,10 +13331,16 @@ function detectCanvasWorkflows(){
         const groupConnections = (connections || []).filter(connection => idSet.has(connection.from) && idSet.has(connection.to));
         const bounds = workflowBoundsForNodes(groupNodes);
         const index = groups.length + 1;
+        const nodeIds = groupNodes.map(node => node.id);
+        const workflowKey = detectedWorkflowKey(nodeIds);
+        const display = detectedWorkflowDisplay(index, workflowKey, groupNodes.length, groupConnections.length);
         groups.push({
             id: `workflow_${index}`,
-            label: `工作流 ${index} · ${groupNodes.length} 节点 · ${groupConnections.length} 连线`,
-            nodeIds: groupNodes.map(node => node.id),
+            workflowKey,
+            name: display.name,
+            customName: display.customName,
+            label: display.label,
+            nodeIds,
             runnableIds,
             connectionIds: groupConnections.map(connection => connection.id),
             nodeCount: groupNodes.length,
@@ -13300,11 +13351,17 @@ function detectCanvasWorkflows(){
         });
     });
     return groups.sort((a, b) => (a.sortX - b.sortX) || (a.sortY - b.sortY) || a.id.localeCompare(b.id))
-        .map((workflow, index) => ({
-            ...workflow,
-            id: `workflow_${index + 1}`,
-            label: `工作流 ${index + 1} · ${workflow.nodeCount} 节点 · ${workflow.connectionCount} 连线`
-        }));
+        .map((workflow, index) => {
+            const workflowId = `workflow_${index + 1}`;
+            const display = detectedWorkflowDisplay(index + 1, workflow.workflowKey, workflow.nodeCount, workflow.connectionCount);
+            return {
+                ...workflow,
+                id: workflowId,
+                name: display.name,
+                customName: display.customName,
+                label: display.label
+            };
+        });
 }
 function workflowBoundsForNodes(list){
     if(!list.length) return {x:0, y:0, w:0, h:0};
@@ -13456,6 +13513,7 @@ function renderWorkflowRunBar(){
         : '<option value="">未识别到可运行工作流</option>';
     const active = activeDetectedWorkflow();
     const running = Boolean(active && isCascadeActive(active.id));
+    if(workflowRunRenameBtn) workflowRunRenameBtn.disabled = !active || running;
     if(workflowRunLocateBtn) workflowRunLocateBtn.disabled = !active;
     if(workflowRunStartBtn) workflowRunStartBtn.disabled = !active || running;
     if(workflowRunStopBtn) workflowRunStopBtn.disabled = !active || !running || isCascadeStopping(active.id);
@@ -13477,6 +13535,45 @@ function locateDetectedWorkflow(workflowId=activeDetectedWorkflowId){
     const workflowNodes = workflow.nodeIds.map(id => nodes.find(node => node.id === id)).filter(Boolean);
     if(!workflowNodes.length) return;
     zoomToNodes(workflowNodes);
+}
+async function renameDetectedWorkflow(){
+    const workflow = activeDetectedWorkflow();
+    if(!workflow || !workflow.workflowKey || !canvas?.id) return;
+    const nextName = window.prompt('工作流名称', workflow.customName || workflow.name || '');
+    if(nextName === null) return;
+    try {
+        const res = await fetch(`/api/automation/canvases/${encodeURIComponent(canvas.id)}/workflows/${encodeURIComponent(workflow.workflowKey)}/name`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: nextName})
+        });
+        if(!res.ok) throw new Error(await responseErrorMessage(res, '重命名工作流失败'));
+        const data = await res.json();
+        canvas.automation_workflow_names = canvas.automation_workflow_names || {};
+        const clean = String(nextName || '').trim().slice(0, 80);
+        if(clean) canvas.automation_workflow_names[workflow.workflowKey] = {name: clean, updated_at: Date.now()};
+        else delete canvas.automation_workflow_names[workflow.workflowKey];
+        if(Number(data.updated_at || 0)){
+            canvas.updated_at = Number(data.updated_at);
+            lastCanvasUpdatedAt = canvas.updated_at;
+            if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at);
+        }
+        detectedWorkflows = Array.isArray(data.workflows) ? data.workflows.map(item => ({
+            ...item,
+            id: item.id || item.workflow_id,
+            workflowKey: item.workflowKey || item.workflow_key,
+            customName: item.customName ?? item.custom_name ?? '',
+            nodeIds: item.nodeIds || item.node_ids || [],
+            runnableIds: item.runnableIds || item.runnable_ids || [],
+            connectionIds: item.connectionIds || item.connection_ids || [],
+            nodeCount: item.nodeCount ?? item.node_count,
+            connectionCount: item.connectionCount ?? item.connection_count,
+        })) : detectedWorkflows;
+        renderWorkflowRunBar();
+        setStatus(clean ? `已重命名工作流：${clean}` : '已清除工作流名称');
+    } catch(err) {
+        showErrorModal(err.message || '重命名工作流失败', '重命名工作流');
+    }
 }
 async function runDetectedWorkflow(workflowId=activeDetectedWorkflowId){
     const workflow = detectedWorkflows.find(item => item.id === workflowId) || null;
