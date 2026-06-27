@@ -2601,6 +2601,7 @@ class AutomationWorkflowRunRequest(BaseModel):
     workflow: Dict[str, Any] = Field(default_factory=dict)
     workflow_name: str = ""
     canvas_id: str = ""
+    canvas_workflow_id: str = ""
     image_urls: List[str] = []
     callback_url: str = ""
 
@@ -3195,17 +3196,20 @@ def automation_load_workflow_preset(name):
         raise HTTPException(status_code=400, detail="自动化工作流预设格式不正确")
     return workflow
 
-def automation_workflow_from_canvas(canvas_id):
+def automation_workflow_from_canvas(canvas_id, canvas_workflow_id=""):
     canvas = load_canvas(canvas_id)
     nodes = canvas.get("nodes") or []
     connections = canvas.get("connections") or []
     if not isinstance(nodes, list) or not isinstance(connections, list):
         raise HTTPException(status_code=400, detail="画布格式不正确，缺少 nodes/connections")
-    return {
+    workflow = {
         "format": "infinite-canvas-workflow",
         "nodes": nodes,
         "connections": connections,
     }
+    if str(canvas_workflow_id or "").strip():
+        return automation_canvas_subworkflow_payload(workflow, canvas_workflow_id)
+    return workflow
 
 def automation_workflow_source(payload):
     if isinstance(payload.workflow, dict) and payload.workflow.get("nodes"):
@@ -3220,7 +3224,7 @@ def automation_resolve_workflow(payload):
     if isinstance(payload.workflow, dict) and payload.workflow.get("nodes"):
         return payload.workflow
     if payload.canvas_id:
-        return automation_workflow_from_canvas(payload.canvas_id)
+        return automation_workflow_from_canvas(payload.canvas_id, payload.canvas_workflow_id)
     if payload.workflow_name:
         return automation_load_workflow_preset(payload.workflow_name)
     raise HTTPException(status_code=400, detail="请提供 workflow、canvas_id 或 workflow_name")
@@ -3236,6 +3240,15 @@ def automation_canvas_records():
             "updated_at": item.get("updated_at", 0),
         })
     return records
+
+def automation_canvas_workflow_records(canvas_id):
+    canvas = load_canvas(canvas_id)
+    workflow = automation_workflow_from_canvas(canvas_id)
+    return {
+        "canvas_id": canvas.get("id") or canvas_id,
+        "title": canvas.get("title", "未命名画布"),
+        "workflows": automation_detect_canvas_workflows(workflow),
+    }
 
 def automation_media_kind_for_node(node):
     kind = str((node or {}).get("mediaKind") or (node or {}).get("kind") or "image").lower()
@@ -12242,6 +12255,7 @@ async def create_automation_workflow_run(payload: AutomationWorkflowRunRequest):
             "callback_error": "",
             "workflow_name": payload.workflow_name,
             "canvas_id": payload.canvas_id,
+            "canvas_workflow_id": payload.canvas_workflow_id,
             "workflow_source": workflow_source,
             "created_at": now,
             "updated_at": now,
@@ -12257,6 +12271,10 @@ async def list_automation_workflows():
 @app.get("/api/automation/canvases")
 async def list_automation_canvases():
     return {"canvases": automation_canvas_records()}
+
+@app.get("/api/automation/canvases/{canvas_id}/workflows")
+async def list_automation_canvas_workflows(canvas_id: str):
+    return automation_canvas_workflow_records(canvas_id)
 
 @app.get("/api/automation/workflow-runs/{task_id}")
 async def get_automation_workflow_run(task_id: str):
