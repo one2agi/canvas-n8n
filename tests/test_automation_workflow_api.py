@@ -1,7 +1,8 @@
 import os
 import sys
 import unittest
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -82,6 +83,43 @@ class AutomationWorkflowApiTests(unittest.TestCase):
         task = main.AUTOMATION_WORKFLOW_TASKS[response.json()["task_id"]]
         self.assertEqual(task["canvas_workflow_id"], "workflow_2")
         self.assertEqual({node["id"] for node in task["workflow"]["nodes"]}, {"img_b", "gen_b", "out_b"})
+
+    def test_run_uses_queued_workflow_snapshot_without_reloading_canvas(self):
+        queued_workflow = {
+            "format": "infinite-canvas-workflow",
+            "nodes": [{"id": "gen_snapshot", "type": "generator"}],
+            "connections": [],
+        }
+        payload = main.AutomationWorkflowRunRequest(
+            canvas_id="canvas123",
+            canvas_workflow_id="workflow_2",
+            image_urls=["https://example.com/product.png"],
+        )
+        task_id = "auto_snapshot"
+        main.AUTOMATION_WORKFLOW_TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "images": [],
+            "error": "",
+            "callback_url": "",
+            "callback_error": "",
+            "workflow_name": "",
+            "canvas_id": payload.canvas_id,
+            "canvas_workflow_id": payload.canvas_workflow_id,
+            "workflow_source": "canvas",
+            "created_at": 1,
+            "updated_at": 1,
+            "workflow": queued_workflow,
+        }
+
+        with patch.object(main, "automation_download_input_images", new=AsyncMock(return_value=[])), \
+             patch.object(main, "load_canvas", side_effect=AssertionError("canvas should not reload")), \
+             patch.object(main, "build_online_image_result", new=AsyncMock(return_value={"images": ["/assets/output/snapshot.png"]})):
+            asyncio.run(main.run_automation_workflow_task(task_id, payload))
+
+        task = main.AUTOMATION_WORKFLOW_TASKS[task_id]
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(task["images"], ["/assets/output/snapshot.png"])
 
 
 if __name__ == "__main__":

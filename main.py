@@ -3243,7 +3243,15 @@ def automation_canvas_records():
 
 def automation_canvas_workflow_records(canvas_id):
     canvas = load_canvas(canvas_id)
-    workflow = automation_workflow_from_canvas(canvas_id)
+    nodes = canvas.get("nodes") or []
+    connections = canvas.get("connections") or []
+    if not isinstance(nodes, list) or not isinstance(connections, list):
+        raise HTTPException(status_code=400, detail="画布格式不正确，缺少 nodes/connections")
+    workflow = {
+        "format": "infinite-canvas-workflow",
+        "nodes": nodes,
+        "connections": connections,
+    }
     return {
         "canvas_id": canvas.get("id") or canvas_id,
         "title": canvas.get("title", "未命名画布"),
@@ -12173,7 +12181,14 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
             task["updated_at"] = time.time()
     try:
         local_images = await automation_download_input_images(payload.image_urls)
-        workflow = automation_apply_input_images(automation_resolve_workflow(payload), local_images)
+        with AUTOMATION_WORKFLOW_LOCK:
+            task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+            queued_workflow = task.get("workflow") if isinstance(task, dict) else None
+        if isinstance(queued_workflow, dict) and queued_workflow.get("nodes"):
+            workflow_source = queued_workflow
+        else:
+            workflow_source = automation_resolve_workflow(payload)
+        workflow = automation_apply_input_images(workflow_source, local_images)
         node_by_id = automation_node_map(workflow)
         target_ids = automation_terminal_generator_ids(workflow)
         if not target_ids:
