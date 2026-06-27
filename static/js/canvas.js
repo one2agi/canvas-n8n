@@ -13324,15 +13324,30 @@ function computeWorkflowRunGraph(workflow){
     const edges = new Map(runnableIds.map(id => [id, new Set()]));
     const indegree = new Map(runnableIds.map(id => [id, 0]));
     const incomingPortRank = new Map();
+    const splitterPortStarts = [];
     const outgoing = new Map();
     (connections || []).forEach(connection => {
         if(!workflowNodeIds.has(connection.from) || !workflowNodeIds.has(connection.to)) return;
         if(!outgoing.has(connection.from)) outgoing.set(connection.from, []);
         outgoing.get(connection.from).push(connection.to);
         const fromNode = nodeById.get(connection.from);
-        if((fromNode?.type === 'json-splitter' || fromNode?.type === 'json-extractor') && runnableSet.has(connection.to)){
+        if(fromNode?.type === 'json-splitter' || fromNode?.type === 'json-extractor'){
             const port = Number.isFinite(Number(connection.fromPort)) ? Number(connection.fromPort) : Infinity;
-            incomingPortRank.set(connection.to, Math.min(incomingPortRank.get(connection.to) ?? Infinity, port));
+            splitterPortStarts.push([connection.to, port]);
+        }
+    });
+    splitterPortStarts.forEach(([startId, port]) => {
+        const queue = [startId];
+        const seen = new Set();
+        while(queue.length){
+            const next = queue.shift();
+            if(seen.has(next) || !workflowNodeIds.has(next)) continue;
+            seen.add(next);
+            if(runnableSet.has(next)){
+                incomingPortRank.set(next, Math.min(incomingPortRank.get(next) ?? Infinity, port));
+                continue;
+            }
+            (outgoing.get(next) || []).forEach(child => queue.push(child));
         }
     });
     const addEdge = (from, to) => {

@@ -2621,11 +2621,18 @@ AUTOMATION_PROMPT_ARRAY_KEY_RANK = {
 AUTOMATION_PROMPT_OBJECT_KEY_RANK = dict(AUTOMATION_PROMPT_ARRAY_KEY_RANK)
 AUTOMATION_PROMPT_TEXT_KEYS = ("content", "prompt", "text", "description")
 
+def automation_detected_safe_number(value, fallback=0):
+    try:
+        number = float(value)
+    except Exception:
+        return fallback
+    return number if math.isfinite(number) else fallback
+
 def automation_detected_node_sort_key(node):
     item = node or {}
     return (
-        float(item.get("x") or 0),
-        float(item.get("y") or 0),
+        automation_detected_safe_number(item.get("x"), 0),
+        automation_detected_safe_number(item.get("y"), 0),
         str(item.get("id") or ""),
     )
 
@@ -2634,10 +2641,10 @@ def automation_workflow_bounds_for_nodes(nodes):
         return {"x": 0, "y": 0, "w": 0, "h": 0}
     rects = []
     for node in nodes:
-        x = float(node.get("x") or 0)
-        y = float(node.get("y") or 0)
-        w = float(node.get("w") or 260)
-        h = float(node.get("h") or 200)
+        x = automation_detected_safe_number(node.get("x"), 0)
+        y = automation_detected_safe_number(node.get("y"), 0)
+        w = automation_detected_safe_number(node.get("w"), 260)
+        h = automation_detected_safe_number(node.get("h"), 200)
         rects.append((x, y, x + w, y + h))
     min_x = min(item[0] for item in rects)
     min_y = min(item[1] for item in rects)
@@ -2970,7 +2977,10 @@ def automation_detect_canvas_workflows(workflow):
         adjacency[to_id].add(from_id)
     for node in nodes:
         node_id = str(node.get("id") or "")
-        for item_id in node.get("items") or []:
+        items = node.get("items")
+        if not isinstance(items, list):
+            continue
+        for item_id in items:
             item_id = str(item_id or "")
             if node_id not in node_by_id or item_id not in node_by_id:
                 continue
@@ -3048,13 +3058,11 @@ def automation_canvas_subworkflow_payload(workflow, canvas_workflow_id):
     if not match:
         raise HTTPException(status_code=404, detail=f"画布子工作流不存在：{workflow_id}")
     node_ids = set(match.get("node_ids") or [])
-    connection_ids = set(match.get("connection_ids") or [])
     nodes = [copy.deepcopy(node) for node in (workflow.get("nodes") or []) if str(node.get("id") or "") in node_ids]
     connections = [
         copy.deepcopy(conn)
         for conn in (workflow.get("connections") or [])
-        if (str(conn.get("id") or "") in connection_ids)
-        or (str(conn.get("from") or "") in node_ids and str(conn.get("to") or "") in node_ids)
+        if str(conn.get("from") or "") in node_ids and str(conn.get("to") or "") in node_ids
     ]
     return {
         "format": "infinite-canvas-workflow",
