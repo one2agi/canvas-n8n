@@ -3111,12 +3111,40 @@ def automation_decoded_internal_asset_path(url):
         path = decoded
     return path.replace("\\", "/")
 
+def automation_internal_asset_path_parts(url):
+    decoded_path = automation_decoded_internal_asset_path(url)
+    mappings = (
+        ("/assets/input/", OUTPUT_INPUT_DIR),
+        ("/assets/output/", OUTPUT_OUTPUT_DIR),
+        ("/output/", OUTPUT_DIR),
+    )
+    for prefix, root in mappings:
+        if decoded_path.startswith(prefix):
+            return decoded_path, prefix, root
+    raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{url}")
+
+def automation_internal_asset_file_path(url):
+    value = str(url or "").strip()
+    decoded_path, prefix, root = automation_internal_asset_path_parts(value)
+    segments = decoded_path.replace("\\", "/").split("/")
+    if ".." in segments:
+        raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
+    rel = decoded_path[len(prefix):].lstrip("/")
+    root_abs = os.path.abspath(root)
+    target = os.path.abspath(os.path.join(root_abs, rel))
+    if os.path.commonpath([root_abs, target]) != root_abs:
+        raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=400, detail=f"内部资源图片不存在：{value}")
+    if not content_type_for_path(target).startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"内部资源不是图片：{value}")
+    return target
+
 def automation_validate_internal_asset_url(url):
     value = str(url or "").strip()
     if not automation_is_internal_asset_url(value):
         raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{value}")
-    if ".." in automation_decoded_internal_asset_path(value).split("/"):
-        raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
+    automation_internal_asset_file_path(value)
     return value
 
 def automation_apply_input_images(workflow, image_urls):
@@ -12207,7 +12235,7 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
             task["status"] = "running"
             task["updated_at"] = time.time()
     try:
-        local_images = await automation_prepare_input_images(payload.image_urls)
+        local_images = await automation_download_input_images(payload.image_urls)
         with AUTOMATION_WORKFLOW_LOCK:
             task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
             queued_workflow = task.get("workflow") if isinstance(task, dict) else None
@@ -12312,9 +12340,19 @@ async def upload_automation_input(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="上传文件为空")
     original_name = file.filename or "automation-input.png"
-    ext = os.path.splitext(original_name)[1] or mimetypes.guess_extension(file.content_type or "") or ".png"
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    ext = (os.path.splitext(original_name)[1] or mimetypes.guess_extension(content_type or "") or "").lower()
     if ext == ".jpe":
         ext = ".jpg"
+    if ext not in LOCAL_IMAGE_IMPORT_EXTS or not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="仅支持 PNG、JPG、JPEG、WEBP、GIF 图片")
+    if len(content) > LOCAL_IMAGE_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="图片过大，请使用 50MB 以内的图片")
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+    except Exception:
+        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
     filename = f"automation_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
     os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
     target = os.path.join(OUTPUT_INPUT_DIR, filename)

@@ -3,6 +3,8 @@ import sys
 import unittest
 import asyncio
 import tempfile
+import struct
+import zlib
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
@@ -10,6 +12,23 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import main
+
+
+def png_bytes():
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\xff\x00\x00")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+PNG_BYTES = png_bytes()
 
 
 class AutomationWorkflowApiTests(unittest.TestCase):
@@ -113,7 +132,7 @@ class AutomationWorkflowApiTests(unittest.TestCase):
             "workflow": queued_workflow,
         }
 
-        with patch.object(main, "automation_prepare_input_images", new=AsyncMock(return_value=[])), \
+        with patch.object(main, "automation_download_input_images", new=AsyncMock(return_value=[])), \
              patch.object(main, "load_canvas", side_effect=AssertionError("canvas should not reload")), \
              patch.object(main, "build_online_image_result", new=AsyncMock(return_value={"images": ["/assets/output/snapshot.png"]})):
             asyncio.run(main.run_automation_workflow_task(task_id, payload))
@@ -124,7 +143,7 @@ class AutomationWorkflowApiTests(unittest.TestCase):
 
     def test_automation_upload_saves_input_asset(self):
         client = TestClient(main.app)
-        uploaded = b"fake-image-bytes"
+        uploaded = PNG_BYTES
 
         with tempfile.TemporaryDirectory() as temp_dir, \
              patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
@@ -143,10 +162,82 @@ class AutomationWorkflowApiTests(unittest.TestCase):
             with open(saved_path, "rb") as f:
                 self.assertEqual(f.read(), uploaded)
 
-    def test_prepare_input_images_accepts_internal_asset_url(self):
-        result = asyncio.run(main.automation_prepare_input_images(["/assets/input/product.png"]))
+    def test_automation_upload_rejects_non_image(self):
+        client = TestClient(main.app)
 
-        self.assertEqual(result, ["/assets/input/product.png"])
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
+            response = client.post(
+                "/api/automation/upload",
+                files={"file": ("not-image.txt", b"not an image", "text/plain")},
+            )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(os.listdir(temp_dir), [])
+
+    def test_automation_upload_rejects_oversized_image(self):
+        client = TestClient(main.app)
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir), \
+             patch.object(main, "LOCAL_IMAGE_IMPORT_MAX_BYTES", len(PNG_BYTES) - 1):
+            response = client.post(
+                "/api/automation/upload",
+                files={"file": ("product.png", PNG_BYTES, "image/png")},
+            )
+
+            self.assertEqual(response.status_code, 413)
+            self.assertEqual(os.listdir(temp_dir), [])
+
+    def test_prepare_input_images_accepts_internal_asset_url(self):
+        with tempfile.TemporaryDirectory() as input_dir, \
+             tempfile.TemporaryDirectory() as asset_output_dir, \
+             tempfile.TemporaryDirectory() as output_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", input_dir), \
+             patch.object(main, "OUTPUT_OUTPUT_DIR", asset_output_dir), \
+             patch.object(main, "OUTPUT_DIR", output_dir):
+            for root in (input_dir, asset_output_dir, output_dir):
+                with open(os.path.join(root, "product.png"), "wb") as f:
+                    f.write(PNG_BYTES)
+            result = asyncio.run(main.automation_prepare_input_images([
+                "/assets/input/product.png",
+                "/assets/output/product.png",
+                "/output/product.png",
+            ]))
+
+        self.assertEqual(result, [
+            "/assets/input/product.png",
+            "/assets/output/product.png",
+            "/output/product.png",
+        ])
+
+    def test_prepare_input_images_rejects_unsupported_internal_asset_area(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
+            with open(os.path.join(temp_dir, "product.png"), "wb") as f:
+                f.write(PNG_BYTES)
+            with self.assertRaises(main.HTTPException) as context:
+                asyncio.run(main.automation_prepare_input_images(["/assets/library/product.png"]))
+
+        self.assertEqual(context.exception.status_code, 400)
+
+    def test_prepare_input_images_rejects_missing_internal_asset_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
+            with self.assertRaises(main.HTTPException) as context:
+                asyncio.run(main.automation_prepare_input_images(["/assets/input/missing.png"]))
+
+        self.assertEqual(context.exception.status_code, 400)
+
+    def test_prepare_input_images_rejects_non_image_internal_asset_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
+            with open(os.path.join(temp_dir, "note.txt"), "wb") as f:
+                f.write(b"not an image")
+            with self.assertRaises(main.HTTPException) as context:
+                asyncio.run(main.automation_prepare_input_images(["/assets/input/note.txt"]))
+
+        self.assertEqual(context.exception.status_code, 400)
 
     def test_prepare_input_images_rejects_encoded_internal_traversal(self):
         urls = [
