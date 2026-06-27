@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 import asyncio
+import tempfile
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
@@ -112,7 +113,7 @@ class AutomationWorkflowApiTests(unittest.TestCase):
             "workflow": queued_workflow,
         }
 
-        with patch.object(main, "automation_download_input_images", new=AsyncMock(return_value=[])), \
+        with patch.object(main, "automation_prepare_input_images", new=AsyncMock(return_value=[])), \
              patch.object(main, "load_canvas", side_effect=AssertionError("canvas should not reload")), \
              patch.object(main, "build_online_image_result", new=AsyncMock(return_value={"images": ["/assets/output/snapshot.png"]})):
             asyncio.run(main.run_automation_workflow_task(task_id, payload))
@@ -120,6 +121,26 @@ class AutomationWorkflowApiTests(unittest.TestCase):
         task = main.AUTOMATION_WORKFLOW_TASKS[task_id]
         self.assertEqual(task["status"], "succeeded")
         self.assertEqual(task["images"], ["/assets/output/snapshot.png"])
+
+    def test_automation_upload_saves_input_asset(self):
+        client = TestClient(main.app)
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(main, "OUTPUT_INPUT_DIR", temp_dir):
+            response = client.post(
+                "/api/automation/upload",
+                files={"file": ("product.png", b"fake-image-bytes", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["url"].startswith("/assets/input/automation_"))
+        self.assertEqual(body["name"], "product.png")
+
+    def test_prepare_input_images_accepts_internal_asset_url(self):
+        result = asyncio.run(main.automation_prepare_input_images(["/assets/input/product.png"]))
+
+        self.assertEqual(result, ["/assets/input/product.png"])
 
 
 if __name__ == "__main__":

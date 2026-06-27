@@ -3098,6 +3098,18 @@ def automation_image_name_from_url(url):
     name = urllib.parse.unquote(os.path.basename(clean))
     return name or "automation-input.png"
 
+def automation_is_internal_asset_url(url):
+    value = str(url or "").strip()
+    return value.startswith("/assets/input/") or value.startswith("/assets/output/") or value.startswith("/output/")
+
+def automation_validate_internal_asset_url(url):
+    value = str(url or "").strip()
+    if not automation_is_internal_asset_url(value):
+        raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{value}")
+    if ".." in value.replace("\\", "/").split("/"):
+        raise HTTPException(status_code=400, detail=f"内部资源路径不合法：{value}")
+    return value
+
 def automation_apply_input_images(workflow, image_urls):
     prepared = copy.deepcopy(workflow or {})
     node_by_id = automation_node_map(prepared)
@@ -3262,15 +3274,18 @@ def automation_media_kind_for_node(node):
     kind = str((node or {}).get("mediaKind") or (node or {}).get("kind") or "image").lower()
     return kind if kind in {"image", "video", "audio"} else "image"
 
-async def automation_download_input_images(image_urls):
-    downloaded = []
+async def automation_prepare_input_images(image_urls):
+    prepared = []
     os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
     timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for index, image_url in enumerate(image_urls or []):
             url = str(image_url or "").strip()
+            if automation_is_internal_asset_url(url):
+                prepared.append(automation_validate_internal_asset_url(url))
+                continue
             if not url.startswith(("http://", "https://")):
-                raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https：{url}")
+                raise HTTPException(status_code=400, detail=f"图片 URL 只支持 http/https 或内部资源路径：{url}")
             response = await client.get(url)
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -3281,8 +3296,11 @@ async def automation_download_input_images(image_urls):
             target = os.path.join(OUTPUT_INPUT_DIR, filename)
             with open(target, "wb") as f:
                 f.write(response.content)
-            downloaded.append(f"/assets/input/{filename}")
-    return downloaded
+            prepared.append(f"/assets/input/{filename}")
+    return prepared
+
+async def automation_download_input_images(image_urls):
+    return await automation_prepare_input_images(image_urls)
 
 def automation_connected_source_nodes(workflow, target_id):
     node_by_id = automation_node_map(workflow)
@@ -12180,7 +12198,7 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
             task["status"] = "running"
             task["updated_at"] = time.time()
     try:
-        local_images = await automation_download_input_images(payload.image_urls)
+        local_images = await automation_prepare_input_images(payload.image_urls)
         with AUTOMATION_WORKFLOW_LOCK:
             task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
             queued_workflow = task.get("workflow") if isinstance(task, dict) else None
@@ -12278,6 +12296,26 @@ async def create_automation_workflow_run(payload: AutomationWorkflowRunRequest):
         }
     asyncio.create_task(run_automation_workflow_task(task_id, payload))
     return {"task_id": task_id, "status": "queued"}
+
+@app.post("/api/automation/upload")
+async def upload_automation_input(file: UploadFile = File(...)):
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    original_name = file.filename or "automation-input.png"
+    ext = os.path.splitext(original_name)[1] or mimetypes.guess_extension(file.content_type or "") or ".png"
+    if ext == ".jpe":
+        ext = ".jpg"
+    filename = f"automation_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+    os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
+    target = os.path.join(OUTPUT_INPUT_DIR, filename)
+    with open(target, "wb") as f:
+        f.write(content)
+    return {
+        "url": f"/assets/input/{filename}",
+        "name": original_name,
+        "size": len(content),
+    }
 
 @app.get("/api/automation/workflows")
 async def list_automation_workflows():
