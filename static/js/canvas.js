@@ -13232,7 +13232,12 @@ function isDetectedWorkflowRunnableNode(node){
 }
 function safeDetectedWorkflowNumber(value, fallback=0){
     if(value === null || value === undefined) return fallback;
-    if(typeof value === 'string' && value.trim() === '') return fallback;
+    if(Array.isArray(value) || (value && typeof value === 'object')) return fallback;
+    if(typeof value !== 'number' && typeof value !== 'string') return fallback;
+    if(typeof value === 'string'){
+        const text = value.trim();
+        if(!text || /^[-+]?0[xob]/i.test(text)) return fallback;
+    }
     const number = Number(value);
     return Number.isFinite(number) ? number : fallback;
 }

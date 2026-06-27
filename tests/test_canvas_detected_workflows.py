@@ -170,6 +170,19 @@ class CanvasDetectedWorkflowTests(unittest.TestCase):
         self.assertEqual(result["workflows"][0]["bounds"], {"x": 0, "y": 0, "w": 260, "h": 200})
         self.assertEqual(result["orders"], [["gen_bad"], ["gen_next"]])
 
+    def test_array_object_and_hex_coordinates_use_backend_fallbacks(self):
+        nodes = [
+            {"id": "array_bad", "type": "generator", "x": [1], "y": {"bad": True}, "w": [1], "h": {"bad": True}},
+            {"id": "hex_bad", "type": "generator", "x": "0x10", "y": 0},
+            {"id": "valid_next", "type": "generator", "x": 1, "y": 0},
+        ]
+        result = run_workflow_algorithm(nodes, [])
+
+        self.assertNotIn("error", result, msg=result.get("error"))
+        self.assertEqual([workflow["nodeIds"] for workflow in result["workflows"]], [["array_bad"], ["hex_bad"], ["valid_next"]])
+        self.assertEqual(result["workflows"][0]["bounds"], {"x": 0, "y": 0, "w": 260, "h": 200})
+        self.assertEqual(result["orders"], [["array_bad"], ["hex_bad"], ["valid_next"]])
+
     def test_connected_group_includes_its_member_image_nodes(self):
         nodes = [
             {"id": "group_1", "type": "group", "x": 0, "y": 0, "items": ["img_1", "img_2"]},
