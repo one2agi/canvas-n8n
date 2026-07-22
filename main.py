@@ -3439,9 +3439,64 @@ def automation_compute_run_order(workflow, target_id):
     visit(target_id)
     return order
 
+def automation_compute_run_plan(workflow, target_ids):
+    workflow = workflow or {}
+    node_ids = [str(node.get("id") or "") for node in workflow.get("nodes") or [] if node.get("id")]
+    order = []
+    for target_id in target_ids or []:
+        for node_id in automation_compute_run_order(workflow, target_id):
+            if node_id not in order:
+                order.append(node_id)
+    graph = automation_compute_detected_run_graph(workflow, {
+        "node_ids": node_ids,
+        "runnable_ids": order,
+    })
+    indegree = dict(graph["indegree"])
+    ready = sorted([node_id for node_id in order if indegree.get(node_id, 0) == 0], key=graph["sort_key"])
+    layers = []
+    layered_order = []
+    while ready:
+        layer = sorted(list(ready), key=graph["sort_key"])
+        layers.append(layer)
+        layered_order.extend(layer)
+        next_ready = []
+        for node_id in layer:
+            for to_id in sorted(graph["edges"].get(node_id) or [], key=graph["sort_key"]):
+                indegree[to_id] = indegree.get(to_id, 0) - 1
+                if indegree.get(to_id) == 0:
+                    next_ready.append(to_id)
+        ready = sorted(next_ready, key=graph["sort_key"])
+    missing = [node_id for node_id in order if node_id not in layered_order]
+    if missing:
+        layers.append(sorted(missing, key=graph["sort_key"]))
+        layered_order.extend(sorted(missing, key=graph["sort_key"]))
+    return {"order": layered_order, "layers": layers}
+
 AUTOMATION_WORKFLOW_TASKS: Dict[str, Dict[str, Any]] = {}
 AUTOMATION_WORKFLOW_LOCK = Lock()
 AUTOMATION_TEST_CALLBACKS: List[Dict[str, Any]] = []
+
+def automation_workflow_stage_for_nodes(workflow, node_ids):
+    node_by_id = automation_node_map(workflow or {})
+    types = [str((node_by_id.get(str(node_id)) or {}).get("type") or "") for node_id in node_ids or []]
+    if not types:
+        return "running"
+    if all(item == "llm" for item in types):
+        return "llm"
+    if all(item in {"json-splitter", "json-extractor"} for item in types):
+        return "json"
+    if all(item == "generator" for item in types):
+        return "generator"
+    return "workflow"
+
+def automation_update_workflow_task(task_id, **fields):
+    with AUTOMATION_WORKFLOW_LOCK:
+        task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+        if not task:
+            return None
+        task.update(fields)
+        task["updated_at"] = time.time()
+        return dict(task)
 
 def automation_task_public(task):
     data = dict(task or {})
@@ -12590,11 +12645,15 @@ async def get_canvas_comfy_task(task_id: str):
     return task
 
 async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflowRunRequest):
-    with AUTOMATION_WORKFLOW_LOCK:
-        task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
-        if task:
-            task["status"] = "running"
-            task["updated_at"] = time.time()
+    automation_update_workflow_task(
+        task_id,
+        status="running",
+        stage="preparing",
+        current_node="",
+        current_nodes=[],
+        completed_nodes=0,
+        total_nodes=0,
+    )
     try:
         local_images = await automation_download_input_images(payload.image_urls)
         with AUTOMATION_WORKFLOW_LOCK:
@@ -12609,17 +12668,28 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
         target_ids = automation_terminal_generator_ids(workflow)
         if not target_ids:
             raise HTTPException(status_code=400, detail="工作流中没有可执行的图片生成节点")
-        run_order = []
-        for target_id in target_ids:
-            for node_id in automation_compute_run_order(workflow, target_id):
-                if node_id not in run_order:
-                    run_order.append(node_id)
+        plan = automation_compute_run_plan(workflow, target_ids)
+        run_order = plan["order"]
+        layers = plan["layers"]
+        automation_update_workflow_task(
+            task_id,
+            stage="running",
+            current_node="",
+            current_nodes=[],
+            completed_nodes=0,
+            total_nodes=len(run_order),
+            run_order=run_order,
+            run_layers=layers,
+        )
         output_images = []
-        for node_id in run_order:
+        completed_nodes = 0
+
+        async def run_node(node_id):
             node = node_by_id.get(node_id)
             if not node:
-                continue
+                return []
             node_type = node.get("type")
+            node_images = []
             if node_type == "llm":
                 node["outputText"] = await automation_call_llm_node(workflow, node)
             elif node_type in {"json-splitter", "json-extractor"}:
@@ -12628,13 +12698,41 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
                 result = await build_online_image_result(automation_build_generator_request(workflow, node))
                 images = [url for url in result.get("images") or [] if url]
                 node["generatedOutputs"] = images
+                node_images.extend(images)
+            return node_images
+
+        for layer in layers:
+            layer = [node_id for node_id in layer if node_id in node_by_id]
+            if not layer:
+                continue
+            automation_update_workflow_task(
+                task_id,
+                stage=automation_workflow_stage_for_nodes(workflow, layer),
+                current_node=layer[0],
+                current_nodes=layer,
+                completed_nodes=completed_nodes,
+                total_nodes=len(run_order),
+            )
+            results = await asyncio.gather(*(run_node(node_id) for node_id in layer))
+            for images in results:
                 output_images.extend(images)
+            completed_nodes += len(layer)
+            automation_update_workflow_task(
+                task_id,
+                completed_nodes=completed_nodes,
+                total_nodes=len(run_order),
+            )
         if not output_images:
             raise HTTPException(status_code=502, detail="自动化工作流完成但没有生成图片")
         with AUTOMATION_WORKFLOW_LOCK:
             task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
             if task:
                 task["status"] = "succeeded"
+                task["stage"] = "succeeded"
+                task["current_node"] = ""
+                task["current_nodes"] = []
+                task["completed_nodes"] = len(run_order)
+                task["total_nodes"] = len(run_order)
                 task["images"] = output_images
                 task["error"] = ""
                 task["workflow"] = workflow
@@ -12657,6 +12755,7 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
             task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
             if task:
                 task["status"] = "failed"
+                task["stage"] = "failed"
                 task["error"] = str(getattr(exc, "detail", None) or exc)
                 task["updated_at"] = time.time()
                 callback_payload = automation_task_public(task)

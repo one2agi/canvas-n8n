@@ -352,6 +352,105 @@ class AutomationWorkflowTests(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json()["status"], "queued")
 
+    def test_backend_workflow_runner_runs_same_layer_generators_concurrently(self):
+        workflow = {
+            "format": "infinite-canvas-workflow",
+            "nodes": [
+                {"id": "img_1", "type": "image", "url": ""},
+                {"id": "llm_1", "type": "llm"},
+                {"id": "split_1", "type": "json-splitter"},
+                {"id": "gen_1", "type": "generator"},
+                {"id": "gen_2", "type": "generator"},
+                {"id": "out_1", "type": "output"},
+            ],
+            "connections": [
+                {"id": "c1", "from": "img_1", "to": "llm_1"},
+                {"id": "c2", "from": "llm_1", "to": "split_1"},
+                {"id": "c3", "from": "split_1", "fromPort": 0, "to": "gen_1"},
+                {"id": "c4", "from": "split_1", "fromPort": 1, "to": "gen_2"},
+                {"id": "c5", "from": "gen_1", "to": "out_1"},
+                {"id": "c6", "from": "gen_2", "to": "out_1"},
+            ],
+        }
+        task_id = "auto_parallel_generators"
+        main.AUTOMATION_WORKFLOW_TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "images": [],
+            "error": "",
+            "workflow": workflow,
+            "created_at": 1,
+            "updated_at": 1,
+        }
+        active_generators = 0
+        max_active_generators = 0
+
+        async def fake_llm(_workflow, _node):
+            return json.dumps({"prompts": ["prompt one", "prompt two"]})
+
+        async def fake_generate(payload):
+            nonlocal active_generators, max_active_generators
+            active_generators += 1
+            max_active_generators = max(max_active_generators, active_generators)
+            await asyncio.sleep(0)
+            active_generators -= 1
+            prompt_slug = (payload.prompt or "image").split()[0]
+            return {"images": [f"/assets/output/{prompt_slug}.png"]}
+
+        with patch.object(main, "automation_download_input_images", AsyncMock(return_value=["/assets/input/product.png"])), \
+             patch.object(main, "automation_call_llm_node", side_effect=fake_llm), \
+             patch.object(main, "build_online_image_result", side_effect=fake_generate):
+            asyncio.run(main.run_automation_workflow_task(task_id, main.AutomationWorkflowRunRequest(workflow=workflow, image_urls=["/assets/input/product.png"])))
+
+        task = main.AUTOMATION_WORKFLOW_TASKS[task_id]
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(len(task["images"]), 2)
+        self.assertEqual(max_active_generators, 2)
+
+    def test_backend_workflow_status_exposes_progress_stage_and_node_counts(self):
+        workflow = {
+            "format": "infinite-canvas-workflow",
+            "nodes": [
+                {"id": "img_1", "type": "image", "url": ""},
+                {"id": "gen_1", "type": "generator"},
+                {"id": "out_1", "type": "output"},
+            ],
+            "connections": [
+                {"id": "c1", "from": "img_1", "to": "gen_1"},
+                {"id": "c2", "from": "gen_1", "to": "out_1"},
+            ],
+        }
+        task_id = "auto_progress_status"
+        main.AUTOMATION_WORKFLOW_TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "images": [],
+            "error": "",
+            "workflow": workflow,
+            "created_at": 1,
+            "updated_at": 1,
+        }
+
+        async def fake_generate(_payload):
+            task = main.automation_task_public(main.AUTOMATION_WORKFLOW_TASKS[task_id])
+            self.assertEqual(task["status"], "running")
+            self.assertEqual(task["stage"], "generator")
+            self.assertEqual(task["current_node"], "gen_1")
+            self.assertEqual(task["completed_nodes"], 0)
+            self.assertEqual(task["total_nodes"], 1)
+            await asyncio.sleep(0)
+            return {"images": ["/assets/output/generated.png"]}
+
+        with patch.object(main, "automation_download_input_images", AsyncMock(return_value=["/assets/input/product.png"])), \
+             patch.object(main, "build_online_image_result", side_effect=fake_generate):
+            asyncio.run(main.run_automation_workflow_task(task_id, main.AutomationWorkflowRunRequest(workflow=workflow, image_urls=["/assets/input/product.png"])))
+
+        task = main.automation_task_public(main.AUTOMATION_WORKFLOW_TASKS[task_id])
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(task["stage"], "succeeded")
+        self.assertEqual(task["completed_nodes"], 1)
+        self.assertEqual(task["total_nodes"], 1)
+
     def test_lists_automation_workflow_presets(self):
         client = TestClient(main.app)
         with tempfile.TemporaryDirectory() as temp_dir:
