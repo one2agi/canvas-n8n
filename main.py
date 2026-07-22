@@ -2604,6 +2604,7 @@ class AutomationWorkflowRunRequest(BaseModel):
     canvas_workflow_id: str = ""
     canvas_workflow_name: str = ""
     image_urls: List[str] = []
+    llm_user_input: str = ""
     callback_url: str = ""
 
 class AutomationCanvasWorkflowNameUpdate(BaseModel):
@@ -2611,6 +2612,7 @@ class AutomationCanvasWorkflowNameUpdate(BaseModel):
 
 AUTOMATION_WORKFLOW_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.-]+$")
 AUTOMATION_RUN_TYPES = {"llm", "json-splitter", "json-extractor", "generator"}
+AUTOMATION_DEFAULT_LLM_USER_INPUT = "请分析上传的商品图片，基于系统提示词生成差异化电商商品图生图 prompt。"
 AUTOMATION_DETECTED_RUN_TYPES = {
     "llm", "json-splitter", "json-extractor", "generator",
     "msgen", "comfy", "ltxDirector", "video", "rh",
@@ -3778,6 +3780,11 @@ def automation_llm_input_text(workflow, node):
 
 async def automation_call_llm_node(workflow, node):
     message = automation_llm_input_text(workflow, node)
+    images = automation_llm_input_images(workflow, node)
+    if not message:
+        message = str((workflow or {}).get("_automation_llm_user_input") or "").strip()
+    if not message and images:
+        message = AUTOMATION_DEFAULT_LLM_USER_INPUT
     if not message:
         raise HTTPException(status_code=400, detail=f"LLM 节点缺少输入：{node.get('id')}")
     result = await canvas_llm(CanvasLLMRequest(
@@ -3787,7 +3794,7 @@ async def automation_call_llm_node(workflow, node):
         provider=str(node.get("llmProvider") or "comfly"),
         system_prompt=str(node.get("systemPrompt") or "You are a helpful assistant."),
         messages=node.get("messages") or [],
-        images=automation_llm_input_images(workflow, node),
+        images=images,
         videos=[],
         output_format=str(node.get("outputFormat") or "text"),
     ))
@@ -12664,6 +12671,7 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
         else:
             workflow_source = automation_resolve_workflow(payload)
         workflow = automation_apply_input_images(workflow_source, local_images)
+        workflow["_automation_llm_user_input"] = str(getattr(payload, "llm_user_input", "") or "").strip()
         node_by_id = automation_node_map(workflow)
         target_ids = automation_terminal_generator_ids(workflow)
         if not target_ids:
