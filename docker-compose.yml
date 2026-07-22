@@ -3,16 +3,17 @@ services:
     build: .
     container_name: infinite-canvas
     ports:
-      - "3000:3000"
+      # 只绑回环（127.0.0.1），避免对外暴露。容器内仍是 3000
+      - "127.0.0.1:8123:3000"
     volumes:
       # 用 Windows 路径格式（Docker Desktop 推荐写法，避开 WSL 9P bind mount bug）
-      # 容器内 /app = 宿主 D:\project\canvas\Infinite-Canvas
-      - "D:/project/canvas/Infinite-Canvas:/app"
+      # 容器内 /app = 宿主 D:\project\TKcaiji\canvas\Infinite-Canvas
+      - "D:/project/TKcaiji/canvas/Infinite-Canvas:/app"
       # 排除容器内 pycache 写到宿主
       - "/app/__pycache__"
       - "/app/.pytest_cache"
     environment:
-      - LLM_MAX_TOKENS=8600
+      - LLM_MAX_TOKENS=16384
       - PYTHONUNBUFFERED=1
       # ComfyUI 通过 host.docker.internal 访问宿主
       - COMFYUI_INSTANCES=host.docker.internal:8188
