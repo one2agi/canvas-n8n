@@ -2849,6 +2849,21 @@ def automation_parse_markdown_prompt_sections(source_text):
             sections.append(body)
     return sections
 
+def automation_extract_jsonish_prompt_values(source_text):
+    text = str(source_text or "")
+    if not text:
+        return []
+    values = []
+    pattern = re.compile(
+        r'"prompt"\s*:\s*"([\s\S]*?)"\s*,\s*"(?:negative_prompt|size|quality|style|image_no|reference|seed|n)"',
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        value = match.group(1).strip()
+        if value:
+            values.append(value)
+    return values
+
 def automation_parse_json_prompt_items(source_text):
     parsed = automation_parse_json_for_splitter(source_text)
     container = automation_find_prompt_array(parsed)
@@ -2861,8 +2876,9 @@ def automation_parse_json_prompt_items(source_text):
         source_items = first_array if first_array is not None else [parsed]
         items = [automation_json_value_to_text(item) for item in source_items]
     else:
+        jsonish_items = automation_extract_jsonish_prompt_values(parsed)
         markdown_items = automation_parse_markdown_prompt_sections(parsed)
-        items = markdown_items or [automation_json_value_to_text(parsed)]
+        items = jsonish_items or markdown_items or [automation_json_value_to_text(parsed)]
     return [str(item or "").strip() for item in items if str(item or "").strip()]
 
 def automation_node_map(workflow):
@@ -4772,8 +4788,9 @@ def text_from_chat_response(data):
 # 推理型模型（Qwen3 / DeepSeek R1 / MiniMax-M3 等）会在最终答案前注入
 # <think>...</think> 思考过程；剥离它才能拿到真正的 JSON / 文本。
 THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-# 兜底：模型有时把 JSON 塞在 markdown ```json ... ``` 代码块里
-FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", re.IGNORECASE)
+# 兜底：模型有时把 JSON 塞在 markdown ```json ... ``` 代码块里。
+# 不在正则里尝试匹配完整 JSON 结构；嵌套对象/数组会让非贪婪匹配提前截断。
+FENCED_JSON_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
 # 兜底：抓取文本中第一个完整的 {...} 或 [...] 块
 FIRST_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.DOTALL)
 FIRST_JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]", re.DOTALL)
@@ -4814,9 +4831,14 @@ def extract_json_object(text: str):
     stripped = strip_think_blocks(text)
     if stripped and stripped != text:
         candidates.append(stripped)
+    balanced = automation_extract_balanced_json_text(stripped or text)
+    if balanced and balanced not in candidates:
+        candidates.append(balanced)
     for fenced in FENCED_JSON_RE.findall(text):
-        if fenced and fenced not in candidates:
-            candidates.append(fenced)
+        fenced_balanced = automation_extract_balanced_json_text(fenced)
+        for candidate in (fenced, fenced_balanced):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
     for obj_match in FIRST_JSON_OBJECT_RE.findall(text):
         if obj_match and obj_match not in candidates:
             candidates.append(obj_match)
@@ -12297,8 +12319,36 @@ async def build_online_image_result(payload: OnlineImageRequest):
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
+    def is_retryable_image_generation_error(exc):
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return False
+        if exc.response.status_code not in {429, 503}:
+            return False
+        text = (exc.response.text or "").lower()
+        return (
+            "queue is full" in text
+            or "retry later" in text
+            or "too many requests" in text
+            or "hostbuffer.read_file_slice failed" in text
+        )
     async def generate_one():
-        image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, image_refs, provider["id"])
+        last_exc = None
+        for attempt in range(5):
+            try:
+                image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, image_refs, provider["id"])
+                break
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if not is_retryable_image_generation_error(exc) or attempt >= 4:
+                    raise
+                await asyncio.sleep(min(15 * (attempt + 1), 60))
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt >= 4:
+                    raise
+                await asyncio.sleep(min(15 * (attempt + 1), 60))
+        else:
+            raise last_exc or HTTPException(status_code=503, detail="上游生图队列繁忙，请稍后重试")
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
         except HTTPException:
@@ -13751,6 +13801,49 @@ async def canvas_llm(payload: CanvasLLMRequest):
         # 推理型模型会先输出 <think>...</think> 思考过程 + 可能嵌套 markdown 代码块，
         # 用多策略 extract_json_object 兜底
         parsed_json = extract_json_object(text)
+        if parsed_json is None and finish_reason != "length":
+            repair_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You repair invalid JSON. Return strict valid JSON only, with no markdown. "
+                        "Preserve all fields and text content. Escape quotation marks inside strings."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Convert this model output into strict valid JSON. "
+                        "Do not add explanations.\n\n"
+                        f"{text}"
+                    )
+                }
+            ]
+            try:
+                async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+                    repair_body = {
+                        "model": model,
+                        "messages": repair_messages,
+                        "max_tokens": LLM_MAX_TOKENS
+                    }
+                    if not _is_apimart:
+                        repair_body["response_format"] = {"type": "json_object"}
+                    if _is_apimart:
+                        repair_body["stream"] = False
+                    repair_response = await client.post(
+                        f"{chat_base}/chat/completions",
+                        headers=chat_hdrs,
+                        json=repair_body,
+                    )
+                    repair_response.raise_for_status()
+                    repair_raw = repair_response.json()
+                    repair_text = extract_chat_text(repair_raw)
+                    repaired_json = extract_json_object(repair_text)
+                    if repaired_json is not None:
+                        parsed_json = repaired_json
+                        text = json.dumps(repaired_json, ensure_ascii=False)
+            except Exception as exc:
+                print(f"[canvas-llm] json repair failed: {str(exc)[:200]}")
         if parsed_json is None:
             preview = text[:200].replace("\n", " ")
             if finish_reason == "length":
@@ -13764,10 +13857,7 @@ async def canvas_llm(payload: CanvasLLMRequest):
                         f"前 200 字符：{preview}"
                     )
                 )
-            raise HTTPException(
-                status_code=422,
-                detail=f"LLM 未返回合法 JSON。前 200 字符：{preview}"
-            )
+            print(f"[canvas-llm] json parse fallback to text. preview={preview}")
     raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else {}
     return {"text": text, "json": parsed_json, "model": model, "raw_usage": raw_data.get("usage")}
 
