@@ -89,6 +89,36 @@ class AutomationLlmUserInputTests(unittest.TestCase):
             [["/assets/input/product.png", "/assets/input/reference.png"], ["/assets/input/product.png", "/assets/input/reference.png"]],
         )
 
+    def test_automation_generator_caps_reference_images_for_live_image_model(self):
+        workflow = {
+            "format": "infinite-canvas-workflow",
+            "nodes": [
+                {"id": "group_images", "type": "group", "items": [f"img_{index}" for index in range(8)]},
+                *[
+                    {"id": f"img_{index}", "type": "image", "url": f"/assets/input/{index}.png", "name": f"产品图{index}"}
+                    for index in range(8)
+                ],
+                {"id": "json_node", "type": "json-splitter", "sourceItems": ["首图prompt"]},
+                {"id": "gen_one", "type": "generator"},
+            ],
+            "connections": [
+                {"id": "c1", "from": "group_images", "to": "gen_one"},
+                {"id": "c2", "from": "json_node", "fromPort": 0, "to": "gen_one"},
+            ],
+        }
+
+        request = main.automation_build_generator_request(workflow, workflow["nodes"][-1])
+
+        self.assertEqual(request.prompt, "首图prompt")
+        self.assertEqual([ref.url for ref in request.reference_images], [
+            "/assets/input/0.png",
+            "/assets/input/1.png",
+            "/assets/input/2.png",
+            "/assets/input/3.png",
+            "/assets/input/4.png",
+            "/assets/input/5.png",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

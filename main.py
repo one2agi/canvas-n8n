@@ -528,6 +528,7 @@ LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 CHAT_ATTACHMENT_MAX = int(os.getenv("CHAT_ATTACHMENT_MAX", "20"))
 ONLINE_IMAGE_REFERENCE_MAX = int(os.getenv("ONLINE_IMAGE_REFERENCE_MAX", "20"))
+AUTOMATION_IMAGE_REFERENCE_MAX = int(os.getenv("AUTOMATION_IMAGE_REFERENCE_MAX", "6"))
 
 FIELD_LABELS = {
     "prompt": "提示词",
@@ -3883,7 +3884,7 @@ def automation_build_generator_request(workflow, node):
         size=automation_generator_size(node),
         quality=str(node.get("quality") or "auto"),
         n=max(1, min(8, int(node.get("count") or 1))),
-        reference_images=[AIReference(**ref) for ref in refs if ref.get("url")],
+        reference_images=[AIReference(**ref) for ref in refs if ref.get("url")][:AUTOMATION_IMAGE_REFERENCE_MAX],
     )
 
 def automation_terminal_generator_ids(workflow):
