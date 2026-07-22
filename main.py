@@ -3746,6 +3746,128 @@ def automation_group_image_refs(workflow, group_node):
             })
     return refs
 
+def automation_output_url_value(item):
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return str(item.get("url") or "")
+    return ""
+
+def automation_image_ref_for_node(node):
+    return {
+        "url": (node or {}).get("url") or "",
+        "name": (node or {}).get("name") or automation_image_name_from_url((node or {}).get("url")),
+        "role": (node or {}).get("role") or "",
+        "kind": automation_media_kind_for_node(node),
+    }
+
+def automation_generator_input_source_candidates(workflow, node):
+    node_by_id = automation_node_map(workflow)
+    sources = []
+    for conn, source in automation_connected_source_nodes(workflow, node.get("id")):
+        if not source:
+            continue
+        source_id = str(source.get("id") or "")
+        source_type = source.get("type")
+        if source_type == "image" and source.get("url"):
+            sources.append({
+                "id": source_id,
+                "prompt": "",
+                "refs": [automation_image_ref_for_node(source)],
+            })
+        elif source_type == "group":
+            group_id = source_id
+            prompt_parts = []
+            for item_id in source.get("items") or []:
+                item = node_by_id.get(str(item_id))
+                if not item:
+                    continue
+                if item.get("type") == "image" and item.get("url") and automation_media_kind_for_node(item) == "image":
+                    sources.append({
+                        "id": f"{group_id}:{item.get('id')}",
+                        "prompt": "",
+                        "refs": [automation_image_ref_for_node(item)],
+                    })
+                elif item.get("type") == "prompt" and item.get("text"):
+                    prompt_parts.append(str(item.get("text") or ""))
+            if prompt_parts:
+                sources.append({
+                    "id": f"{group_id}:prompts",
+                    "prompt": "\n\n".join(prompt_parts),
+                    "refs": [],
+                })
+        elif source_type == "output" and source.get("images"):
+            reversed_images = list(enumerate(source.get("images") or []))
+            for output_index, item in reversed(reversed_images):
+                url = automation_output_url_value(item)
+                if url:
+                    sources.append({
+                        "id": source_id,
+                        "prompt": "",
+                        "refs": [{
+                            "url": url,
+                            "name": automation_image_name_from_url(url) or "output.png",
+                            "role": "",
+                            "kind": "image",
+                            "nodeId": source_id,
+                            "outputIndex": output_index,
+                        }],
+                    })
+                    break
+        elif source_type == "generator" and source.get("generatedOutputs"):
+            for output_index, item in enumerate(source.get("generatedOutputs") or []):
+                url = automation_output_url_value(item)
+                if not url:
+                    continue
+                sources.append({
+                    "id": f"{source_id}:generated:{output_index}:{url}",
+                    "prompt": "",
+                    "refs": [{
+                        "url": url,
+                        "name": automation_image_name_from_url(url) or f"generated-{output_index + 1}",
+                        "role": "",
+                        "kind": "image",
+                    }],
+                })
+        elif source_type == "prompt" and source.get("text"):
+            sources.append({
+                "id": source_id,
+                "prompt": str(source.get("text") or ""),
+                "refs": [],
+            })
+        elif source_type == "llm" and source.get("outputText"):
+            sources.append({
+                "id": source_id,
+                "prompt": str(source.get("outputText") or ""),
+                "refs": [],
+            })
+        elif source_type in {"json-splitter", "json-extractor"} and isinstance(source.get("sourceItems"), list):
+            source_items = source.get("sourceItems") or []
+            if node.get("inputs"):
+                for port_index, item in enumerate(source_items):
+                    sources.append({
+                        "id": f"{source_id}:port:{port_index}",
+                        "prompt": str(item or ""),
+                        "refs": [],
+                    })
+            elif source_items:
+                port_index = int(conn.get("fromPort") or 0)
+                item = source_items[port_index] if port_index < len(source_items) else source_items[0]
+                sources.append({
+                    "id": f"{source_id}:port:{port_index}",
+                    "prompt": str(item or ""),
+                    "refs": [],
+                })
+    return sources
+
+def automation_ordered_generator_input_sources(workflow, node):
+    candidates = automation_generator_input_source_candidates(workflow, node)
+    inputs = [str(item or "") for item in (node or {}).get("inputs") or [] if str(item or "")]
+    if not inputs:
+        return candidates
+    by_id = {str(source.get("id") or ""): source for source in candidates}
+    return [by_id[source_id] for source_id in inputs if source_id in by_id]
+
 def automation_llm_input_images(workflow, node):
     refs = []
     for _conn, source in automation_connected_source_nodes(workflow, node.get("id")):
@@ -3830,30 +3952,12 @@ def automation_run_json_splitter_node(workflow, node):
     return node["sourceItems"]
 
 def automation_generator_sources(workflow, node):
+    sources = automation_ordered_generator_input_sources(workflow, node)
+    prompts = [str(source.get("prompt") or "") for source in sources if source.get("prompt")]
     refs = []
-    prompts = []
-    for conn, source in automation_connected_source_nodes(workflow, node.get("id")):
-        if not source:
-            continue
-        source_type = source.get("type")
-        if source_type == "image" and source.get("url"):
-            refs.append({
-                "url": source.get("url") or "",
-                "name": source.get("name") or automation_image_name_from_url(source.get("url")),
-                "role": source.get("role") or "",
-                "kind": automation_media_kind_for_node(source),
-            })
-        elif source_type == "group":
-            refs.extend(automation_group_image_refs(workflow, source))
-        elif source_type == "prompt" and source.get("text"):
-            prompts.append(str(source.get("text") or ""))
-        elif source_type == "llm" and source.get("outputText"):
-            prompts.append(str(source.get("outputText") or ""))
-        elif source_type in {"json-splitter", "json-extractor"} and isinstance(source.get("sourceItems"), list):
-            port_index = int(conn.get("fromPort") or 0)
-            item = source["sourceItems"][port_index] if port_index < len(source["sourceItems"]) else source["sourceItems"][0]
-            prompts.append(str(item or ""))
-    return prompts, refs
+    for source in sources:
+        refs.extend(source.get("refs") or [])
+    return prompts, refs, [str(source.get("id") or "") for source in sources if source.get("id")]
 
 def automation_generator_size(node):
     custom = str(node.get("customSize") or "").strip()
@@ -3874,10 +3978,10 @@ def automation_generator_size(node):
         return f"{base}x{base}"
     return f"{base}x{base}"
 
-def automation_build_generator_request(workflow, node):
-    prompts, refs = automation_generator_sources(workflow, node)
+def automation_build_generator_request_with_sources(workflow, node):
+    prompts, refs, source_ids = automation_generator_sources(workflow, node)
     prompt = "\n\n".join(item for item in prompts if item).strip() or "Edit the reference images."
-    return OnlineImageRequest(
+    request = OnlineImageRequest(
         prompt=prompt,
         provider_id=str(node.get("apiProvider") or "comfly"),
         model=str(node.get("model") or ""),
@@ -3886,6 +3990,26 @@ def automation_build_generator_request(workflow, node):
         n=max(1, min(8, int(node.get("count") or 1))),
         reference_images=[AIReference(**ref) for ref in refs if ref.get("url")][:AUTOMATION_IMAGE_REFERENCE_MAX],
     )
+    return request, source_ids
+
+def automation_build_generator_request(workflow, node):
+    request, _source_ids = automation_build_generator_request_with_sources(workflow, node)
+    return request
+
+def automation_generator_debug_entry(node, request, source_ids):
+    prompt = str((request or {}).prompt if hasattr(request, "prompt") else "")
+    return {
+        "node_id": str((node or {}).get("id") or ""),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else "",
+        "prompt_preview": prompt[:160],
+        "prompt_length": len(prompt),
+        "reference_count": len((request or {}).reference_images if hasattr(request, "reference_images") else []),
+        "reference_names": [
+            str(ref.name or automation_image_name_from_url(ref.url) or "")
+            for ref in ((request or {}).reference_images if hasattr(request, "reference_images") else [])
+        ],
+        "selected_source_ids": [str(item or "") for item in source_ids or [] if str(item or "")],
+    }
 
 def automation_terminal_generator_ids(workflow):
     node_by_id = automation_node_map(workflow)
@@ -12661,6 +12785,7 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
         current_nodes=[],
         completed_nodes=0,
         total_nodes=0,
+        generator_debug=[],
     )
     try:
         local_images = await automation_download_input_images(payload.image_urls)
@@ -12704,7 +12829,14 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
             elif node_type in {"json-splitter", "json-extractor"}:
                 automation_run_json_splitter_node(workflow, node)
             elif node_type == "generator":
-                result = await build_online_image_result(automation_build_generator_request(workflow, node))
+                request, source_ids = automation_build_generator_request_with_sources(workflow, node)
+                debug_entry = automation_generator_debug_entry(node, request, source_ids)
+                with AUTOMATION_WORKFLOW_LOCK:
+                    task = AUTOMATION_WORKFLOW_TASKS.get(task_id)
+                    if task is not None:
+                        task.setdefault("generator_debug", []).append(debug_entry)
+                        task["updated_at"] = time.time()
+                result = await build_online_image_result(request)
                 images = [url for url in result.get("images") or [] if url]
                 node["generatedOutputs"] = images
                 node_images.extend(images)
