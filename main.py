@@ -529,6 +529,55 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 CHAT_ATTACHMENT_MAX = int(os.getenv("CHAT_ATTACHMENT_MAX", "20"))
 ONLINE_IMAGE_REFERENCE_MAX = int(os.getenv("ONLINE_IMAGE_REFERENCE_MAX", "20"))
 AUTOMATION_IMAGE_REFERENCE_MAX = int(os.getenv("AUTOMATION_IMAGE_REFERENCE_MAX", "6"))
+IMAGE_GENERATION_GLOBAL_CONCURRENCY = max(1, int(os.getenv("IMAGE_GENERATION_GLOBAL_CONCURRENCY", "3")))
+AUTOMATION_GENERATOR_CONCURRENCY_PER_RUN = max(1, int(os.getenv("AUTOMATION_GENERATOR_CONCURRENCY_PER_RUN", "1")))
+
+_IMAGE_GENERATION_SEMAPHORE = None
+_IMAGE_GENERATION_SEMAPHORE_LOOP = None
+_IMAGE_GENERATION_CONCURRENCY_LOCK = Lock()
+_IMAGE_GENERATION_ACTIVE_REQUESTS = 0
+_IMAGE_GENERATION_WAITING_REQUESTS = 0
+
+def image_generation_global_snapshot():
+    with _IMAGE_GENERATION_CONCURRENCY_LOCK:
+        return {
+            "global_generator_concurrency_limit": IMAGE_GENERATION_GLOBAL_CONCURRENCY,
+            "global_active_generator_requests": _IMAGE_GENERATION_ACTIVE_REQUESTS,
+            "global_waiting_generator_requests": _IMAGE_GENERATION_WAITING_REQUESTS,
+        }
+
+def image_generation_global_semaphore():
+    global _IMAGE_GENERATION_SEMAPHORE, _IMAGE_GENERATION_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    with _IMAGE_GENERATION_CONCURRENCY_LOCK:
+        if _IMAGE_GENERATION_SEMAPHORE is None or _IMAGE_GENERATION_SEMAPHORE_LOOP is not loop:
+            if _IMAGE_GENERATION_ACTIVE_REQUESTS or _IMAGE_GENERATION_WAITING_REQUESTS:
+                raise RuntimeError("生图并发调度器不能跨事件循环共享活动请求")
+            _IMAGE_GENERATION_SEMAPHORE = asyncio.Semaphore(IMAGE_GENERATION_GLOBAL_CONCURRENCY)
+            _IMAGE_GENERATION_SEMAPHORE_LOOP = loop
+        return _IMAGE_GENERATION_SEMAPHORE
+
+async def run_with_global_image_generation_limit(operation):
+    global _IMAGE_GENERATION_ACTIVE_REQUESTS, _IMAGE_GENERATION_WAITING_REQUESTS
+    semaphore = image_generation_global_semaphore()
+    acquired = False
+    with _IMAGE_GENERATION_CONCURRENCY_LOCK:
+        _IMAGE_GENERATION_WAITING_REQUESTS += 1
+    try:
+        await semaphore.acquire()
+        acquired = True
+        with _IMAGE_GENERATION_CONCURRENCY_LOCK:
+            _IMAGE_GENERATION_WAITING_REQUESTS -= 1
+            _IMAGE_GENERATION_ACTIVE_REQUESTS += 1
+        return await operation()
+    finally:
+        with _IMAGE_GENERATION_CONCURRENCY_LOCK:
+            if acquired:
+                _IMAGE_GENERATION_ACTIVE_REQUESTS -= 1
+            else:
+                _IMAGE_GENERATION_WAITING_REQUESTS -= 1
+        if acquired:
+            semaphore.release()
 
 FIELD_LABELS = {
     "prompt": "提示词",
@@ -3504,6 +3553,7 @@ def automation_update_workflow_task(task_id, **fields):
 def automation_task_public(task):
     data = dict(task or {})
     data.pop("workflow", None)
+    data.update(image_generation_global_snapshot())
     return data
 
 def automation_workflow_filename(name):
@@ -12509,20 +12559,21 @@ async def build_online_image_result(payload: OnlineImageRequest):
     def is_retryable_image_generation_error(exc):
         if not isinstance(exc, httpx.HTTPStatusError):
             return False
-        if exc.response.status_code not in {429, 503}:
-            return False
-        text = (exc.response.text or "").lower()
-        return (
-            "queue is full" in text
-            or "retry later" in text
-            or "too many requests" in text
-            or "hostbuffer.read_file_slice failed" in text
-        )
+        return exc.response.status_code in {429, 502, 503}
     async def generate_one():
         last_exc = None
         for attempt in range(5):
             try:
-                image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, image_refs, provider["id"])
+                image_data, raw_item = await run_with_global_image_generation_limit(
+                    lambda: generate_ai_image(
+                        payload.prompt,
+                        payload.size,
+                        payload.quality,
+                        model,
+                        image_refs,
+                        provider["id"],
+                    )
+                )
                 break
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
@@ -12554,11 +12605,14 @@ async def build_online_image_result(payload: OnlineImageRequest):
         log_net_error(f"生图 HTTP状态错误 provider={provider.get('id')} model={model} size={payload.size}", exc)
         text = exc.response.text or ''
         friendly = friendly_image_error_detail(text, payload.size, model)
-        detail = friendly or f"上游生图接口错误：{text[:300]}"
+        if is_retryable_image_generation_error(exc):
+            detail = friendly or "上游生图服务繁忙，已自动重试5次，请稍后继续处理。"
+        else:
+            detail = friendly or f"上游生图请求失败（HTTP {exc.response.status_code}），请检查模型参数或服务配置。"
         raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
     except httpx.HTTPError as exc:
         log_net_error(f"生图 网络/TLS错误 provider={provider.get('id')} model={model}", exc)
-        raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail="请求上游生图服务失败，已自动重试5次，请稍后继续处理。") from exc
 
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
@@ -12786,6 +12840,9 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
         completed_nodes=0,
         total_nodes=0,
         generator_debug=[],
+        generator_concurrency_limit=AUTOMATION_GENERATOR_CONCURRENCY_PER_RUN,
+        active_generator_nodes=0,
+        waiting_generator_nodes=0,
     )
     try:
         local_images = await automation_download_input_images(payload.image_urls)
@@ -12817,6 +12874,41 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
         )
         output_images = []
         completed_nodes = 0
+        generator_semaphore = asyncio.Semaphore(AUTOMATION_GENERATOR_CONCURRENCY_PER_RUN)
+        active_generator_nodes = 0
+        waiting_generator_nodes = 0
+
+        async def run_generator_node(request):
+            nonlocal active_generator_nodes, waiting_generator_nodes
+            acquired = False
+            waiting_generator_nodes += 1
+            automation_update_workflow_task(
+                task_id,
+                active_generator_nodes=active_generator_nodes,
+                waiting_generator_nodes=waiting_generator_nodes,
+            )
+            try:
+                await generator_semaphore.acquire()
+                acquired = True
+                waiting_generator_nodes -= 1
+                active_generator_nodes += 1
+                automation_update_workflow_task(
+                    task_id,
+                    active_generator_nodes=active_generator_nodes,
+                    waiting_generator_nodes=waiting_generator_nodes,
+                )
+                return await build_online_image_result(request)
+            finally:
+                if acquired:
+                    active_generator_nodes -= 1
+                    generator_semaphore.release()
+                else:
+                    waiting_generator_nodes -= 1
+                automation_update_workflow_task(
+                    task_id,
+                    active_generator_nodes=active_generator_nodes,
+                    waiting_generator_nodes=waiting_generator_nodes,
+                )
 
         async def run_node(node_id):
             node = node_by_id.get(node_id)
@@ -12836,7 +12928,7 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
                     if task is not None:
                         task.setdefault("generator_debug", []).append(debug_entry)
                         task["updated_at"] = time.time()
-                result = await build_online_image_result(request)
+                result = await run_generator_node(request)
                 images = [url for url in result.get("images") or [] if url]
                 node["generatedOutputs"] = images
                 node_images.extend(images)
@@ -12872,6 +12964,8 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
                 task["stage"] = "succeeded"
                 task["current_node"] = ""
                 task["current_nodes"] = []
+                task["active_generator_nodes"] = 0
+                task["waiting_generator_nodes"] = 0
                 task["completed_nodes"] = len(run_order)
                 task["total_nodes"] = len(run_order)
                 task["images"] = output_images
@@ -12897,6 +12991,8 @@ async def run_automation_workflow_task(task_id: str, payload: AutomationWorkflow
             if task:
                 task["status"] = "failed"
                 task["stage"] = "failed"
+                task["active_generator_nodes"] = 0
+                task["waiting_generator_nodes"] = 0
                 task["error"] = str(getattr(exc, "detail", None) or exc)
                 task["updated_at"] = time.time()
                 callback_payload = automation_task_public(task)
@@ -12922,6 +13018,9 @@ async def create_automation_workflow_run(payload: AutomationWorkflowRunRequest):
             "status": "queued",
             "images": [],
             "error": "",
+            "generator_concurrency_limit": AUTOMATION_GENERATOR_CONCURRENCY_PER_RUN,
+            "active_generator_nodes": 0,
+            "waiting_generator_nodes": 0,
             "callback_url": payload.callback_url,
             "callback_error": "",
             "workflow_name": payload.workflow_name,

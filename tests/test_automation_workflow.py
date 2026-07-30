@@ -4,6 +4,7 @@ import sys
 import unittest
 import asyncio
 import tempfile
+import uuid
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
@@ -352,7 +353,7 @@ class AutomationWorkflowTests(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json()["status"], "queued")
 
-    def test_backend_workflow_runner_runs_same_layer_generators_concurrently(self):
+    def test_backend_workflow_runner_limits_same_product_to_one_generator(self):
         workflow = {
             "format": "infinite-canvas-workflow",
             "nodes": [
@@ -361,6 +362,9 @@ class AutomationWorkflowTests(unittest.TestCase):
                 {"id": "split_1", "type": "json-splitter"},
                 {"id": "gen_1", "type": "generator"},
                 {"id": "gen_2", "type": "generator"},
+                {"id": "gen_3", "type": "generator"},
+                {"id": "gen_4", "type": "generator"},
+                {"id": "gen_5", "type": "generator"},
                 {"id": "out_1", "type": "output"},
             ],
             "connections": [
@@ -368,11 +372,17 @@ class AutomationWorkflowTests(unittest.TestCase):
                 {"id": "c2", "from": "llm_1", "to": "split_1"},
                 {"id": "c3", "from": "split_1", "fromPort": 0, "to": "gen_1"},
                 {"id": "c4", "from": "split_1", "fromPort": 1, "to": "gen_2"},
-                {"id": "c5", "from": "gen_1", "to": "out_1"},
-                {"id": "c6", "from": "gen_2", "to": "out_1"},
+                {"id": "c5", "from": "split_1", "fromPort": 2, "to": "gen_3"},
+                {"id": "c6", "from": "split_1", "fromPort": 3, "to": "gen_4"},
+                {"id": "c7", "from": "split_1", "fromPort": 4, "to": "gen_5"},
+                {"id": "c8", "from": "gen_1", "to": "out_1"},
+                {"id": "c9", "from": "gen_2", "to": "out_1"},
+                {"id": "c10", "from": "gen_3", "to": "out_1"},
+                {"id": "c11", "from": "gen_4", "to": "out_1"},
+                {"id": "c12", "from": "gen_5", "to": "out_1"},
             ],
         }
-        task_id = "auto_parallel_generators"
+        task_id = "auto_bounded_generators"
         main.AUTOMATION_WORKFLOW_TASKS[task_id] = {
             "task_id": task_id,
             "status": "queued",
@@ -386,7 +396,13 @@ class AutomationWorkflowTests(unittest.TestCase):
         max_active_generators = 0
 
         async def fake_llm(_workflow, _node):
-            return json.dumps({"prompts": ["prompt one", "prompt two"]})
+            return json.dumps({"prompts": [
+                "one product",
+                "two product",
+                "three product",
+                "four product",
+                "five product",
+            ]})
 
         async def fake_generate(payload):
             nonlocal active_generators, max_active_generators
@@ -404,8 +420,233 @@ class AutomationWorkflowTests(unittest.TestCase):
 
         task = main.AUTOMATION_WORKFLOW_TASKS[task_id]
         self.assertEqual(task["status"], "succeeded")
-        self.assertEqual(len(task["images"]), 2)
-        self.assertEqual(max_active_generators, 2)
+        self.assertEqual(task["images"], [
+            "/assets/output/one.png",
+            "/assets/output/two.png",
+            "/assets/output/three.png",
+            "/assets/output/four.png",
+            "/assets/output/five.png",
+        ])
+        self.assertEqual(max_active_generators, 1)
+        self.assertEqual(task["generator_concurrency_limit"], 1)
+        self.assertEqual(task["active_generator_nodes"], 0)
+        self.assertEqual(task["waiting_generator_nodes"], 0)
+
+    def test_online_image_generation_caps_all_requests_at_global_limit(self):
+        active_requests = 0
+        max_active_requests = 0
+
+        async def fake_generate(*_args, **_kwargs):
+            nonlocal active_requests, max_active_requests
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+            await asyncio.sleep(0.01)
+            active_requests -= 1
+            return "data:image/png;base64,ZmFrZQ==", {"url": "data:image/png;base64,ZmFrZQ=="}
+
+        async def fake_save(*_args, **_kwargs):
+            return f"/output/{uuid.uuid4().hex}.png"
+
+        payload = main.OnlineImageRequest(prompt="test product", n=8)
+        with patch.object(main, "generate_ai_image", side_effect=fake_generate), \
+             patch.object(main, "save_ai_image_to_output", side_effect=fake_save):
+            result = asyncio.run(main.build_online_image_result(payload))
+
+        self.assertEqual(len(result["images"]), 8)
+        self.assertEqual(max_active_requests, 3)
+
+    def test_online_image_generation_retries_http_503_service_busy(self):
+        import httpx
+
+        calls = 0
+        request = httpx.Request("POST", "https://provider.example/v1/images/generations")
+        busy_response = httpx.Response(503, request=request, text='{"detail":"Service busy"}')
+
+        async def fake_generate(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.HTTPStatusError(
+                    "503 Service Unavailable",
+                    request=request,
+                    response=busy_response,
+                )
+            return "data:image/png;base64,ZmFrZQ==", {"url": "data:image/png;base64,ZmFrZQ=="}
+
+        with patch.object(main, "generate_ai_image", side_effect=fake_generate), \
+             patch.object(main, "save_ai_image_to_output", AsyncMock(return_value="/output/recovered.png")), \
+             patch.object(main.asyncio, "sleep", AsyncMock()) as sleep_mock:
+            result = asyncio.run(main.build_online_image_result(main.OnlineImageRequest(prompt="test product")))
+
+        self.assertEqual(result["images"], ["/output/recovered.png"])
+        self.assertEqual(calls, 2)
+        sleep_mock.assert_awaited_once_with(15)
+
+    def test_retry_backoff_releases_global_generation_slot(self):
+        import httpx
+
+        request = httpx.Request("POST", "https://provider.example/v1/images/generations")
+        busy_response = httpx.Response(503, request=request, text='{"detail":"Service busy"}')
+        first_attempts = 0
+
+        async def scenario():
+            retry_sleep_started = asyncio.Event()
+            allow_retry = asyncio.Event()
+            second_request_started = asyncio.Event()
+
+            async def fake_generate(prompt, *_args, **_kwargs):
+                nonlocal first_attempts
+                if prompt == "first product":
+                    first_attempts += 1
+                    if first_attempts == 1:
+                        raise httpx.HTTPStatusError(
+                            "503 Service Unavailable",
+                            request=request,
+                            response=busy_response,
+                        )
+                if prompt == "second product":
+                    second_request_started.set()
+                return "data:image/png;base64,ZmFrZQ==", {"url": "data:image/png;base64,ZmFrZQ=="}
+
+            async def fake_sleep(_seconds):
+                retry_sleep_started.set()
+                await allow_retry.wait()
+
+            with patch.object(main, "IMAGE_GENERATION_GLOBAL_CONCURRENCY", 1), \
+                 patch.object(main, "generate_ai_image", side_effect=fake_generate), \
+                 patch.object(main, "save_ai_image_to_output", AsyncMock(return_value="/output/generated.png")), \
+                 patch.object(main.asyncio, "sleep", side_effect=fake_sleep):
+                first_task = asyncio.create_task(main.build_online_image_result(
+                    main.OnlineImageRequest(prompt="first product")
+                ))
+                await retry_sleep_started.wait()
+                second_task = asyncio.create_task(main.build_online_image_result(
+                    main.OnlineImageRequest(prompt="second product")
+                ))
+                await asyncio.wait_for(second_request_started.wait(), timeout=0.5)
+                allow_retry.set()
+                return await asyncio.gather(first_task, second_task)
+
+        results = asyncio.run(scenario())
+
+        self.assertEqual(first_attempts, 2)
+        self.assertEqual([result["images"] for result in results], [
+            ["/output/generated.png"],
+            ["/output/generated.png"],
+        ])
+
+    def test_exhausted_busy_retries_return_safe_message(self):
+        import httpx
+
+        request = httpx.Request("POST", "https://provider.example/v1/images/generations")
+        response = httpx.Response(
+            503,
+            request=request,
+            text='{"detail":"Service busy","authorization":"Bearer secret-value"}',
+        )
+
+        async def fake_generate(*_args, **_kwargs):
+            raise httpx.HTTPStatusError(
+                "503 Service Unavailable",
+                request=request,
+                response=response,
+            )
+
+        with patch.object(main, "generate_ai_image", side_effect=fake_generate), \
+             patch.object(main.asyncio, "sleep", AsyncMock()):
+            with self.assertRaises(main.HTTPException) as ctx:
+                asyncio.run(main.build_online_image_result(main.OnlineImageRequest(prompt="test product")))
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn("已自动重试5次", ctx.exception.detail)
+        self.assertNotIn("secret-value", ctx.exception.detail)
+        self.assertNotIn("authorization", ctx.exception.detail.lower())
+
+    def test_three_products_progress_together_without_internal_fanout(self):
+        active_generators = 0
+        max_active_generators = 0
+
+        def workflow_for(product_number):
+            generators = [
+                {
+                    "id": f"gen_{product_number}_{image_number}",
+                    "type": "generator",
+                    "prompt": f"product {product_number} image {image_number}",
+                }
+                for image_number in range(5)
+            ]
+            return {
+                "format": "infinite-canvas-workflow",
+                "nodes": generators,
+                "connections": [],
+            }
+
+        async def fake_generate(payload):
+            nonlocal active_generators, max_active_generators
+            active_generators += 1
+            max_active_generators = max(max_active_generators, active_generators)
+            await asyncio.sleep(0.01)
+            active_generators -= 1
+            slug = payload.prompt.replace(" ", "-")
+            return {"images": [f"/assets/output/{slug}.png"]}
+
+        async def run_three_products():
+            operations = []
+            for product_number in range(3):
+                task_id = f"auto_product_{product_number}"
+                workflow = workflow_for(product_number)
+                main.AUTOMATION_WORKFLOW_TASKS[task_id] = {
+                    "task_id": task_id,
+                    "status": "queued",
+                    "images": [],
+                    "error": "",
+                    "workflow": workflow,
+                    "created_at": 1,
+                    "updated_at": 1,
+                }
+                operations.append(main.run_automation_workflow_task(
+                    task_id,
+                    main.AutomationWorkflowRunRequest(workflow=workflow),
+                ))
+            await asyncio.gather(*operations)
+
+        with patch.object(main, "automation_download_input_images", AsyncMock(return_value=[])), \
+             patch.object(main, "build_online_image_result", side_effect=fake_generate):
+            asyncio.run(run_three_products())
+
+        self.assertEqual(max_active_generators, 3)
+        for product_number in range(3):
+            task = main.AUTOMATION_WORKFLOW_TASKS[f"auto_product_{product_number}"]
+            self.assertEqual(task["status"], "succeeded")
+            self.assertEqual(len(task["images"]), 5)
+
+    def test_online_image_generation_does_not_retry_client_errors(self):
+        import httpx
+
+        request = httpx.Request("POST", "https://provider.example/v1/images/generations")
+
+        for status_code in (400, 401):
+            calls = 0
+            response = httpx.Response(status_code, request=request, text='{"detail":"invalid request"}')
+
+            async def fake_generate(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                raise httpx.HTTPStatusError(
+                    f"{status_code} client error",
+                    request=request,
+                    response=response,
+                )
+
+            with self.subTest(status_code=status_code), \
+                 patch.object(main, "generate_ai_image", side_effect=fake_generate), \
+                 patch.object(main.asyncio, "sleep", AsyncMock()) as sleep_mock:
+                with self.assertRaises(main.HTTPException) as ctx:
+                    asyncio.run(main.build_online_image_result(main.OnlineImageRequest(prompt="test product")))
+
+            self.assertEqual(ctx.exception.status_code, status_code)
+            self.assertEqual(calls, 1)
+            sleep_mock.assert_not_awaited()
 
     def test_backend_workflow_status_exposes_progress_stage_and_node_counts(self):
         workflow = {
@@ -438,6 +679,10 @@ class AutomationWorkflowTests(unittest.TestCase):
             self.assertEqual(task["current_node"], "gen_1")
             self.assertEqual(task["completed_nodes"], 0)
             self.assertEqual(task["total_nodes"], 1)
+            self.assertEqual(task["generator_concurrency_limit"], 1)
+            self.assertEqual(task["active_generator_nodes"], 1)
+            self.assertEqual(task["waiting_generator_nodes"], 0)
+            self.assertEqual(task["global_generator_concurrency_limit"], 3)
             await asyncio.sleep(0)
             return {"images": ["/assets/output/generated.png"]}
 
